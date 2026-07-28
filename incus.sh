@@ -1,6 +1,6 @@
 #!/bin/bash
 # =======================================================================
-# Incus 宿主网络安全自愈与容器动态清洗一体化部署脚本 (1-3人代理专版)
+# Incus 宿主网络安全自愈与容器动态清洗一体化部署脚本 (1-3人代理专版 - 修正版)
 # =======================================================================
 
 set -e
@@ -185,29 +185,21 @@ for ip in "${WHITELIST_IPS[@]}"; do
     ipset add whitelist_ips_static "$ip" 2>/dev/null || true
 done
 
-while iptables -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner nobody -j ACCEPT 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner nobody -j ACCEPT 2>/dev/null; do :; done
+# === 规则清理阶段 (无视错误，确保干净) ===
+set +e
+iptables -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT 2>/dev/null
+iptables -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT 2>/dev/null
+iptables -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner nobody -j ACCEPT 2>/dev/null
+iptables -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner nobody -j ACCEPT 2>/dev/null
 while iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53535 2>/dev/null; do :; done
 while iptables -t nat -D OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports 53535 2>/dev/null; do :; done
-
-iptables -t nat -I OUTPUT 1 -p udp --dport 53 -j REDIRECT --to-ports 53535
-iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j REDIRECT --to-ports 53535
-iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -m owner --uid-owner nobody -j ACCEPT
-iptables -t nat -I OUTPUT 1 -p udp --dport 53 -m owner --uid-owner nobody -j ACCEPT
-iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT
-iptables -t nat -I OUTPUT 1 -p udp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT
 
 if [ -n "$BLOCK_OUT_PORTS" ]; then
     while iptables -D FORWARD -i incusbr0 -p tcp -m multiport --dports "$BLOCK_OUT_PORTS" -j REJECT 2>/dev/null; do :; done
 fi
 
-# 【清理旧版残留】清除不带 NEW 状态限制的旧版 UDP 拦截规则
 while iptables -D OUTPUT -p udp -m set --match-set cnip dst -j REJECT 2>/dev/null; do :; done
 while iptables -D FORWARD -i incusbr0 -p udp -m set --match-set cnip dst -j REJECT 2>/dev/null; do :; done
-
-# 常规规则清理
 while iptables -D OUTPUT -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT 2>/dev/null; do :; done
 while iptables -D FORWARD -i incusbr0 -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT 2>/dev/null; do :; done
 while iptables -D OUTPUT -p tcp -m set --match-set cnip dst --syn -j REJECT 2>/dev/null; do :; done
@@ -229,11 +221,11 @@ while iptables -D FORWARD -i incusbr0 -p udp --dport 53 -m string --hex-string "
 while iptables -D FORWARD -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT 2>/dev/null; do :; done
 while iptables -D FORWARD -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
 while iptables -D FORWARD -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
+
 while iptables -D OUTPUT -m set --match-set whitelist_ips_static dst -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -m set --match-set whitelist_ips_static dst -j ACCEPT 2>/dev/null; do :; done
 while iptables -D OUTPUT -m set --match-set whitelist_ips_dynamic dst -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -m set --match-set whitelist_ips_dynamic dst -j ACCEPT 2>/dev/null; do :; done
-
 while iptables -D FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -i incusbr0 -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -o incusbr0 -j ACCEPT 2>/dev/null; do :; done
@@ -243,47 +235,62 @@ for domain in "${WHITELIST_DOMAINS[@]}"; do
     while iptables -D OUTPUT -p udp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT 2>/dev/null; do :; done
     while iptables -D OUTPUT -p tcp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT 2>/dev/null; do :; done
 done
+set -e
 
+# === 规则注入阶段 (严格控制顺序) ===
+
+iptables -t nat -I OUTPUT 1 -p udp --dport 53 -j REDIRECT --to-ports 53535
+iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j REDIRECT --to-ports 53535
+iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -m owner --uid-owner nobody -j ACCEPT
+iptables -t nat -I OUTPUT 1 -p udp --dport 53 -m owner --uid-owner nobody -j ACCEPT
+iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT
+iptables -t nat -I OUTPUT 1 -p udp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT
+
+# 1. 首先插入底层兜底规则 (会被后续规则顶下去，优先级最低)
 iptables -I FORWARD 1 -o incusbr0 -j ACCEPT
 iptables -I FORWARD 1 -i incusbr0 -j ACCEPT
 iptables -I FORWARD 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-# 仅封杀容器端口
+# 2. 插入中层拦截规则 (优先级高于兜底放行)
+# 拦截 DNS 中的恶意后缀
+iptables -I INPUT 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+iptables -I INPUT 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+iptables -I INPUT 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
+iptables -I INPUT 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
+
+iptables -I FORWARD 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+iptables -I FORWARD 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+iptables -I FORWARD 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
+iptables -I FORWARD 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
+
+iptables -I OUTPUT 1 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+iptables -I OUTPUT 1 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+iptables -I OUTPUT 1 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
+iptables -I OUTPUT 1 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
+
+# 封杀高危端口
 if [ -n "$BLOCK_OUT_PORTS" ]; then
     iptables -I FORWARD 1 -i incusbr0 -p tcp -m multiport --dports "$BLOCK_OUT_PORTS" -j REJECT
 fi
 
-# 核心修改点：加入 -m conntrack --ctstate NEW，允许大陆主动连进来，阻止服务器主动攻击大陆
-iptables -I OUTPUT 1 -p tcp -m set --match-set cnip dst --syn -j REJECT
-iptables -I OUTPUT 1 -p udp -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -p tcp -m set --match-set cnip dst --syn -j REJECT
+# 拦截去往国内的新连接
 iptables -I FORWARD 1 -i incusbr0 -p udp -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT
+iptables -I FORWARD 1 -i incusbr0 -p tcp -m set --match-set cnip dst --syn -j REJECT
+iptables -I OUTPUT 1 -p udp -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT
+iptables -I OUTPUT 1 -p tcp -m set --match-set cnip dst --syn -j REJECT
 
-iptables -I OUTPUT 1 -m set --match-set whitelist_ips_dynamic dst -j ACCEPT
-iptables -I OUTPUT 1 -m set --match-set whitelist_ips_static dst -j ACCEPT
-iptables -I FORWARD 1 -m set --match-set whitelist_ips_dynamic dst -j ACCEPT
-iptables -I FORWARD 1 -m set --match-set whitelist_ips_static dst -j ACCEPT
-
+# 3. 插入顶层特权白名单 (最后插入，会被顶到最前面，拥有最高优先级)
 for domain in "${WHITELIST_DOMAINS[@]}"; do
     clean_domain=$(echo "$domain" | sed 's/^\*\.//')
-    iptables -I OUTPUT 1 -p udp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT
     iptables -I OUTPUT 1 -p tcp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT
+    iptables -I OUTPUT 1 -p udp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT
 done
 
-iptables -I OUTPUT 1 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I OUTPUT 1 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I OUTPUT 1 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-iptables -I OUTPUT 1 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+iptables -I FORWARD 1 -m set --match-set whitelist_ips_static dst -j ACCEPT
+iptables -I FORWARD 1 -m set --match-set whitelist_ips_dynamic dst -j ACCEPT
+iptables -I OUTPUT 1 -m set --match-set whitelist_ips_static dst -j ACCEPT
+iptables -I OUTPUT 1 -m set --match-set whitelist_ips_dynamic dst -j ACCEPT
 
-iptables -I FORWARD 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-
-iptables -I INPUT 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I INPUT 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I INPUT 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-iptables -I INPUT 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
 INIT
 
 chmod +x "$INIT_SCRIPT"
