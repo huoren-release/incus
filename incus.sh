@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.2.0  用法：incus.sh [--apply-only|--scan-only]
+# v6.2.1  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -27,7 +27,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.0"
+SCRIPT_VERSION="6.2.1"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -222,10 +222,10 @@ sync_cnip() {
 
 # 并发解析整份白名单，输出一行一个 IP
 resolve_whitelist() {
-    local family=$1 out d
+    local rrtype=$1 out d
     out=$(mktemp)
     for d in $(uniq_wl_domains); do
-        ( dig +short +time=1 +tries=1 "$d" "$family" 2>/dev/null \
+        ( dig +short +time=1 +tries=1 "$d" "$rrtype" 2>/dev/null \
             | grep -E '^[0-9a-fA-F:.]+$' >> "$out" ) &
     done
     wait
@@ -236,7 +236,8 @@ resolve_whitelist() {
 # 白名单静态池：先填临时集合，条数达标才 swap；DNS 全挂时保留旧集合
 fill_whitelist_static() {
     local base=$1 family=$2; shift 2
-    local ips=("$@") tmp="${base}_tmp" n want
+    local ips=("$@") tmp="${base}_tmp" n want rr
+    if [ "$family" = inet6 ]; then rr="AAAA"; else rr="A"; fi
     ipset create "$tmp" hash:net family "$family" -exist 2>/dev/null
     ipset flush "$tmp" 2>/dev/null
     for ip in "${ips[@]}"; do
@@ -244,7 +245,7 @@ fill_whitelist_static() {
     done
     while read -r ip; do
         [ -n "$ip" ] && ipset add "$tmp" "$ip" -exist 2>/dev/null
-    done < <(resolve_whitelist "$family")
+    done < <(resolve_whitelist "$rr")
     n=$(ipset list "$tmp" 2>/dev/null | grep -cE '^[0-9a-fA-F:.]+(/[0-9]+)?$')
     want=$(( ${#ips[@]} + 10 ))
     ipset create "$base" hash:net family "$family" -exist 2>/dev/null
@@ -329,6 +330,9 @@ have_xt_string() { iptables -m string --help 2>&1 | grep -q -- "--algo"; }
 # $1=iptables|ip6tables  $2=链名  $3=作用域  $4=cnip 集合  $5/$6=白名单池  $7=定位池
 fill_chain() {
     local IPT=$1 ch=$2 scope=$3 set_cnip=$4 set_dyn=$5 set_static=$6 set_geo=$7 d iif=""
+    # ip6tables 的 REJECT 类型名与 v4 不同，写错会静默失败、v6 拦截整块失效
+    local RT="icmp-port-unreachable"
+    [ "$IPT" = "ip6tables" ] && RT="icmp6-port-unreachable"
     $IPT -F "$ch" 2>/dev/null || return 0
 
     # ① 防送中 SNI 熔断（最优先；只做 443，定位上报不走明文 HTTP）
@@ -341,7 +345,7 @@ fill_chain() {
     # ② 防送中 独立 IP 定位端点
     if [ "$scope" != "in" ]; then
         $IPT -A "$ch" -m set --match-set "$set_geo" dst -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
-        $IPT -A "$ch" -m set --match-set "$set_geo" dst -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        $IPT -A "$ch" -m set --match-set "$set_geo" dst -j REJECT --reject-with "$RT" 2>/dev/null
     fi
 
     # ③ 测速类白名单（优先于 CN 拦截）
@@ -353,27 +357,27 @@ fill_chain() {
         if [ "$scope" = "forward" ] || [ "$scope" = "in" ]; then
             iif="-i incusbr0"
         fi
-        $IPT -A "$ch" $iif -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
-        $IPT -A "$ch" $iif -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
-        $IPT -A "$ch" $iif -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
-        $IPT -A "$ch" $iif -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        $IPT -A "$ch" $iif -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT --reject-with "$RT" 2>/dev/null
+        $IPT -A "$ch" $iif -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT --reject-with "$RT" 2>/dev/null
+        $IPT -A "$ch" $iif -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT --reject-with "$RT" 2>/dev/null
+        $IPT -A "$ch" $iif -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT --reject-with "$RT" 2>/dev/null
     fi
 
     if [ "$scope" = "forward" ]; then
         # ⑤ 容器出站高危端口
         [ -n "$BLOCK_OUT_PORTS" ] && \
-            $IPT -A "$ch" -i incusbr0 -p tcp -m multiport --dports "$BLOCK_OUT_PORTS" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+            $IPT -A "$ch" -i incusbr0 -p tcp -m multiport --dports "$BLOCK_OUT_PORTS" -j REJECT --reject-with "$RT" 2>/dev/null
         # ⑥ 拦截去往 CN 的新连接
-        $IPT -A "$ch" -i incusbr0 -m set --match-set "$set_cnip" dst -p tcp --syn -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
-        $IPT -A "$ch" -i incusbr0 -m set --match-set "$set_cnip" dst -p udp -m conntrack --ctstate NEW -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        $IPT -A "$ch" -i incusbr0 -m set --match-set "$set_cnip" dst -p tcp --syn -j REJECT --reject-with "$RT" 2>/dev/null
+        $IPT -A "$ch" -i incusbr0 -m set --match-set "$set_cnip" dst -p udp -m conntrack --ctstate NEW -j REJECT --reject-with "$RT" 2>/dev/null
         # ⑦ 兜底放行（放行必须在拦截之后）
         $IPT -A "$ch" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
         $IPT -A "$ch" -i incusbr0 -j ACCEPT 2>/dev/null
         $IPT -A "$ch" -o incusbr0 -j ACCEPT 2>/dev/null
     elif [ "$scope" = "out" ]; then
         # ⑥ 宿主自身 → CN 的新连接
-        $IPT -A "$ch" -m set --match-set "$set_cnip" dst -p tcp --syn -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
-        $IPT -A "$ch" -m set --match-set "$set_cnip" dst -p udp -m conntrack --ctstate NEW -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        $IPT -A "$ch" -m set --match-set "$set_cnip" dst -p tcp --syn -j REJECT --reject-with "$RT" 2>/dev/null
+        $IPT -A "$ch" -m set --match-set "$set_cnip" dst -p udp -m conntrack --ctstate NEW -j REJECT --reject-with "$RT" 2>/dev/null
     fi
     return 0
 }
