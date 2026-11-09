@@ -1,4 +1,4 @@
-# Incus 宿主安全一体化脚本 v6.0.0
+# Incus 宿主安全一体化脚本 v6.1.0
 
 违规巡检自愈 + 拦截出站 CN 请求 + 防送中（Google/Apple 等定位上报）。
 
@@ -6,7 +6,7 @@
 
 | 文件 | 作用 | 用法 |
 |---|---|---|
-| `incus-cron.sh` | **部署脚本**（跑一次） | `bash incus-cron.sh` |
+| `incus-cron.sh` | **部署脚本**（跑一次） | `bash incus-cron.sh [--apply-only\|--scan-only\|--uninstall\|--pin]` |
 | `incus.sh` | **执行体**（每 5 分钟由 cron 调用） | 由 wrapper 调用，也可手动 `--apply-only` / `--scan-only` |
 
 ## 一键部署
@@ -21,6 +21,8 @@ bash incus-cron.sh
 部署脚本会把 `incus.sh` 安装到 `/usr/local/lib/incus-guard/incus.sh`，
 并生成 wrapper `/usr/local/bin/incus_cron.sh` + crontab（每 5 分钟）。
 
+卸载：`bash incus-cron.sh --uninstall`（历史规则快照保留在 `/etc/iptables-custom/snapshot-*.rules`）。
+
 ## incus.sh 的三种模式
 
 ```bash
@@ -28,6 +30,14 @@ bash /usr/local/lib/incus-guard/incus.sh               # 全量：防火墙 + �
 bash /usr/local/lib/incus-guard/incus.sh --apply-only  # 只重建防火墙（开机服务用）
 bash /usr/local/lib/incus-guard/incus.sh --scan-only   # 只扫描不重装（验证用）
 ```
+
+## 名单单一来源
+
+所有域名/端口名单都在 `/etc/iptables-custom/whitelist.conf`，由部署脚本生成，
+`incus.sh` 启动时 `source` 它；文件不存在时回落到脚本内置默认值。
+改名单只需改这一处，然后重跑部署脚本（或直接编辑该文件，下一轮 cron 生效）。
+
+域名按后缀匹配：写 `speedtest.net` 就等于覆盖 `*.speedtest.net`，不要再写 `*.` 前缀。
 
 ## 功能
 
@@ -42,9 +52,15 @@ bash /usr/local/lib/incus-guard/incus.sh --scan-only   # 只扫描不重装（�
 - 容器出站高危端口 22/23/445/3389/6379/2375/2376
 - 黑洞域名（百度/淘宝/QQ 等 23 条）在 dnsmasq 层导 0.0.0.0
 
-**3. 防送中（拦截定位上报）**
+**3. 测速 / 延迟检测白名单**
+38 个常见域名（Ookla/Speedtest、fast.com、Cloudflare、openspeedtest、librespeed、
+testmy.net、nperf、ping.pe/sx、captive.apple.com、gstatic、msftconnecttest、
+detectportal.firefox.com、ipinfo/ip-api/ip.sb 等）解析出的 IP 自动进
+`whitelist_ips_dynamic`，优先于 CN 拦截 → 测速和延迟检测永远能用。
+
+**4. 防送中（拦截定位上报）**
 - **SNI 层**（`-m string` 匹配 TLS ClientHello）：`geolocation.googleapis.com`、`geocode.googleapis.com`、`locationhistory`、`userlocation(s).googleapis.com`、`semanticlocation`、`gs-loc(-cn).apple.com`、`.ls.apple.com`、`maps-api.apple.com`、MLS/微软/Skyhook/BeaconDB
-- **IP 层**（ipset `geo_v4`）：Apple/微软/Mozilla/Skyhook/BeaconDB 的独立定位端点，2 小时刷新
+- **IP 层**（ipset `geo_v4`）：Apple/微软/Mozilla/Skyhook/BeaconDB 的独立定位端点，每轮刷新
 - Google 定位与 Play 商店共用 Anycast IP，所以按 SNI 拦、不按 IP 拦 —— Play 不受影响
 
 ## 架构：独立链，不抢系统链
@@ -61,31 +77,46 @@ INPUT   → INCUS_GUARD_IN (第 1 位)
 这样第三方规则（例如另一套防送中脚本）挂在系统链上也仍然生效，
 不会被本脚本的 `-j ACCEPT` 兜底规则压到后面。
 
-## 键修复点（v6.0.0）
+## 不劫持宿主 53 端口
 
-- **修复误重装**：关键词改走 `incus exec --env`（不进 argv），扫描前先快照 PID，
-  并排除自身及直接子进程 → 消灭「脚本扫到自己命令行」的误判。
-  历史日志里 458 次重装中有 **431 次是 `违规进程: ew`** 的误杀。
-- **短关键词**改为按可执行文件名精确相等（`lcx nps npc bore suo5 nmap zmap`），
-  不再做 `-w` 子串匹配；`ew` 已剔除。
-- **wrapper 加 flock**：上一轮没跑完就跳过，避免 `*/5` 撞 10 分钟上限。
-- **失败不静默**：非零退出、耗时 >300s、防火墙自检不通过都写日志。
-- **不删 `/etc/resolv.conf`**：旧版 `rm -f` 在 bind 挂载的机器上会 EBUSY 直接崩，
-  且会覆盖厂商 DNS。
-- **sha256 pin + 远端开关**：`ENABLE_REMOTE=0` 只跑本地副本；改 1 后每轮拉远端并校验。
-- **CN IP 库校验条数**：<1000 条视为异常，保留旧版。
+旧版会把宿主 UDP/TCP 53 全部 REDIRECT 到 `127.0.0.1:53535` 的 dnsmasq。
+**v6.1.0 去掉了这一层**，原因：
+
+- 容器的 DNS 本来就由 incusbr0 自带 dnsmasq 处理（`raw.dnsmasq` 里带同样的
+  `ipset=` 指令），解析结果照样写进宿主内核的 `whitelist_ips_dynamic`；
+- 宿主去 CN 的流量在 `OUTPUT` 按 `cnip` 网段拦截，不依赖 DNS 黑洞；
+- 劫持的唯一好处是宿主自己也走 DNS 黑洞，代价是**dnsmasq 一旦没装/挂了，
+  宿主 DNS 立刻全废**，而 `dnsmasq.service` 只随 `dnsmasq` 包提供
+  （Incus 只依赖 `dnsmasq-base`），换台新机器必炸。
+
+升级时会自动清理旧版留下的 nat 规则与 `/etc/dnsmasq.d/dynamic_whitelist.conf`，
+并在确认该配置没有别的用途后 `systemctl disable --now dnsmasq`。
+
+## 关键修复点（v6.1.0）
+
+- **wrapper 透传参数**：`--apply-only` / `--scan-only` 现在真的生效；
+  旧版参数被吞，开机兜底 `init.sh` 会退化成全量扫描甚至重装容器。
+- **默认远端更新** `ENABLE_REMOTE=1`：每轮拉 `main`，先 `bash -n` 语法门禁，
+  失败则沿用本地副本。重跑部署脚本不会再把它悄悄改回 0。
+- **`--pin` 可选锁定**：`bash incus-cron.sh --pin` 会把 `PIN_SHA256` 写成当前安装
+  那份的哈希，此后远端哈希不符就拒绝执行（等于「必须人工审核才能更新」）。
+  默认留空 = 跟随 main。注意：跟随 main 意味着谁有本仓库写权限，谁就能以 root
+  在这台机器上执行任意脚本。
+- **crontab 写保护**：读现有 crontab 失败（不只是「no crontab」）时直接中止，
+  不再可能写入空表把别人的定时任务清掉；写后读回校验。
+- **应用前快照**：`/etc/iptables-custom/snapshot-<时间戳>.rules`，保留最近 3 份。
+- **logrotate**：`size 5M × 4 + compress`，替代原来只会在有事件时才触发的内联裁剪。
+- **超时 240s**：小于 cron 的 300s 间隔，不会再出现一轮吃掉下一轮。
+- **首轮返回码**：部署结束按首轮真实 rc 退出并明示成功/失败。
+- **名字版本号单一**：`WRAPPER_VERSION` 由部署脚本变量注入，不再有两处写死。
+- **镜像源**：只有依赖安装失败才切回官方源（备份 `.bak-incusguard`），
+  装得上就绝不动，Debian/Ubuntu 都按发行版和架构选官方地址。
 
 ## 回滚
 
 ```bash
-crontab -l | grep -v incus_cron.sh | crontab -
-rm -f /usr/local/bin/incus_cron.sh /usr/local/lib/incus-guard/incus.sh
-rm -f /etc/systemd/system/custom-firewall.service
-systemctl daemon-reload
-iptables -D FORWARD -j INCUS_GUARD; iptables -F INCUS_GUARD; iptables -X INCUS_GUARD
-iptables -D OUTPUT  -j INCUS_GUARD_OUT; iptables -F INCUS_GUARD_OUT; iptables -X INCUS_GUARD_OUT
-iptables -D INPUT   -j INCUS_GUARD_IN;  iptables -F INCUS_GUARD_IN;  iptables -X INCUS_GUARD_IN
-ipset destroy geo_v4
+bash incus-cron.sh --uninstall                     # 推荐
+iptables-restore < /etc/iptables-custom/snapshot-<时间戳>.rules   # 恢复旧规则
 ```
 
 ## 已知限制
@@ -93,3 +124,4 @@ ipset destroy geo_v4
 - 只拦 TCP 443 的 SNI，**UDP/443（HTTP/3）不拦**；ECH 开启时 SNI 非明文会失明
 - `www.googleapis.com` 通用入口有意不拦（保 Play 商店）
 - 黑洞域名只拦 DNS，容器用 DoH 或直连 IP 可绕过；真正生效的是 `cnip` ipset
+- 白名单是「解析到的 IP 放行」，CDN 轮换后最长要等一轮（5 分钟）才更新
