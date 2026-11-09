@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.2.4  用法：incus.sh [--apply-only|--scan-only]
+# v6.2.6  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -27,7 +27,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.4"
+SCRIPT_VERSION="6.2.6"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -114,7 +114,7 @@ CNIP_LIST="${CONF_DIR}/cnip.list"
 CNIP6_LIST="${CONF_DIR}/cnip6.list"
 LOG_FILE="/var/log/incus_clean.log"
 WRAPPER="/usr/local/bin/incus_cron.sh"
-WRAPPER_VERSION="7"
+WRAPPER_VERSION="8"
 CH_GUARD="INCUS_GUARD"
 CH_GUARD_OUT="INCUS_GUARD_OUT"
 CH_GUARD_IN="INCUS_GUARD_IN"
@@ -602,8 +602,16 @@ for project in $PROJECT_LIST; do
                     TXT=$(tr "\0" "\n" < /proc/$p/cmdline 2>/dev/null)
                     [ -z "$TXT" ] && continue
 
-                    # 只看每个参数的文件名部分与可执行文件名，路径不再误伤
-                    BASE=$(printf "%s\n" "$TXT" | while IFS= read -r t; do printf "%s\n" "${t##*/}"; done)
+                    # 只看每个参数的文件名部分与可执行文件名：
+                    # 剥掉目录与 --key=value 的前缀，并跳过配置文件类后缀，
+                    # 这样 /etc/prometheus/x.yml、--config=/opt/grafana/y.json 不再误伤
+                    BASE=$(printf "%s\n" "$TXT" | while IFS= read -r t; do
+                        t="${t##*=}"; t="${t##*/}"
+                        case "$t" in
+                            *.yml|*.yaml|*.conf|*.json|*.log|*.txt|*.md|*.html|*.xml|*.ini|*.toml|*.properties|*.pid|*.lock|"") continue ;;
+                        esac
+                        printf "%s\n" "$t"
+                    done)
                     BIN=$(readlink /proc/$p/exe 2>/dev/null)
                     [ -n "$BIN" ] && BASE="$BASE
 ${BIN##*/}"
@@ -618,6 +626,7 @@ ${BIN##*/}"
                 for f in /opt/nezha/agent/nezha-agent /usr/local/bin/nezha-agent /usr/local/bin/nezha_agent /root/nezha-agent /etc/init.d/nezha-agent /etc/systemd/system/nezha-agent.service; do
                     [ -e "$f" ] && { echo "残留文件: $f"; exit 0; }
                 done
+                exit 0
             ' < /dev/null 2>/dev/null)
         EXEC_RC=$?
 
