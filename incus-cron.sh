@@ -1,53 +1,69 @@
 #!/bin/bash
 # =======================================================================
-# Linux 通用防火墙单向阻断与 Incus 巡检一体化部署脚本 (v5.16.2 部署专用稳定版)
+# Incus 宿主网络安全一体化部署脚本 v6.0.0
+#   1) 装依赖、写 dnsmasq / ipset / CN 库
+#   2) 生成定时执行体 wrapper（带 flock、退出码告警、sha256 pin）
+#   3) 立即应用一次防火墙（含防送中）
+# 与旧版差异：
+#   - 不再 rm /etc/resolv.conf（bind 挂载的机器上会 EBUSY 直接崩，且会覆盖厂商 DNS）
+#   - 不再全局大扫除系统链，规则落在自有链 INCUS_GUARD/_OUT/_IN
+#   - wrapper 带版本号，可在老机器上原地升级
 # =======================================================================
 
-set -e
-set -o pipefail
+set -uo pipefail
 
-# =======================================================================
-# 🌟 全局自定义双重白名单配置
-# =======================================================================
+CONF_DIR="/etc/iptables-custom"
+INIT_SCRIPT="${CONF_DIR}/init.sh"
+WRAPPER="/usr/local/bin/incus_cron.sh"
+WRAPPER_VERSION="3"
+LOG_FILE="/var/log/incus_clean.log"
+REMOTE_URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
+CNIP_URL="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/cn/ipv4-aggregated.txt"
+
+# 固定的 incus.sh 校验值（发布时填入；留空则跳过校验并在日志里提示）
+PIN_SHA256=""
+
 WHITELIST_DOMAINS=(
     "zstaticcdn.com"
     "*.zstaticcdn.com"
+    "*.ooklaserver.net"
+    "*.speedtest.net"
+    "*.fast.com"
+    "speed.cloudflare.com"
 )
 
 WHITELIST_IPS=(
     "1.1.1.1"
     "8.8.8.8"
 )
-# =======================================================================
 
-CRON_SCRIPT="/usr/local/bin/incus_cron.sh"
-INIT_SCRIPT="/etc/iptables-custom/init.sh"
-CONF_DIR="/etc/iptables-custom"
-LOG_FILE="/var/log/incus_clean.log"
+BLACKLIST_DOMAINS=(
+    "baidu.com" "taobao.com" "qq.com" "jd.com" "bilibili.com" "163.com"
+    "weibo.com" "zhihu.com" "douyin.com" "kuaishou.com" "alipay.com"
+    "alibaba.com" "tencent.com" "sohu.com" "sina.com" "360.com"
+    "iqiyi.com" "youku.com" "xiaohongshu.com" "pinduoduo.com"
+    "meituan.com" "ele.me" "aliyun.com"
+)
 
-echo "=================================================="
-echo "🛡️  第一阶段：配置单向阻断防火墙与宿主 DNS 劫持"
-echo "=================================================="
+BLOCK_OUT_PORTS="22,23,445,3389,6379,2375,2376"
 
-# 【修复 1】：设置 DEBIAN_FRONTEND 为非交互模式，防止 apt 卡住
+log() { echo "[$(date '+%F %T')] $*"; }
+
+[ "$(id -u)" -eq 0 ] || { echo "必须以 root 运行"; exit 1; }
+
+# ---------------------------------------------------------------- 依赖
 export DEBIAN_FRONTEND=noninteractive
+apt-get update -yq || true
+apt-get install -yq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+    ipset iptables dnsutils curl cron util-linux || true
+systemctl enable --now cron >/dev/null 2>&1 || true
 
-# 【修复 2】：将安装步骤提前，并加入静默处理参数
-apt-get update -y
-apt-get install -y -q -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" ipset curl iptables dnsmasq dnsutils cron
-systemctl enable --now cron
-
-# 释放 DNS 配置文件
-rm -f /etc/resolv.conf
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-
-OS_TYPE="ubuntu"
+# ---------------------------------------------------------------- apt 源（deb822 也覆盖）
+OS_TYPE="ubuntu"; ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    [ "$ID" = "debian" ] && OS_TYPE="debian"
+    [ "${ID:-}" = "debian" ] && OS_TYPE="debian"
 fi
-ARCH=$(dpkg --print-architecture)
-
 if [ "$OS_TYPE" = "debian" ]; then
     OFFICIAL_URL="http://deb.debian.org/debian/"
     MATCH_REGEX="s#https?://[^/]*(aliyun|tencent|tsinghua|ustc|huaweicloud)[^/]*/debian/?#${OFFICIAL_URL}#g"
@@ -59,187 +75,194 @@ else
     fi
     MATCH_REGEX="s#https?://[^/]*(aliyun|tencent|tsinghua|ustc|huaweicloud)[^/]*/(ubuntu-ports|ubuntu)/?#${OFFICIAL_URL}#g"
 fi
-
-find /etc/apt/ -name "*.list" -type f | while read -r list_file; do
-    if grep -qE "aliyun|tencent|tsinghua|ustc|huaweicloud" "$list_file"; then
-        sed -i -E "${MATCH_REGEX}" "$list_file"
-    fi
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    grep -qE "aliyun|tencent|tsinghua|ustc|huaweicloud" "$f" 2>/dev/null || continue
+    cp -a "$f" "${f}.bak-noanyloc" 2>/dev/null || true
+    sed -i -E "${MATCH_REGEX}" "$f" 2>/dev/null || true
 done
 
-# 【修复 3】：依赖安装完成后，再进行 dnsmasq 配置
+# ---------------------------------------------------------------- dnsmasq（宿主）
 mkdir -p /etc/dnsmasq.d
-echo "conf-dir=/etc/dnsmasq.d/,*.conf" > /etc/dnsmasq.conf
+if [ ! -f /etc/dnsmasq.conf ] || ! grep -q "conf-dir=/etc/dnsmasq.d/" /etc/dnsmasq.conf; then
+    echo "conf-dir=/etc/dnsmasq.d/,*.conf" > /etc/dnsmasq.conf
+fi
 
-HOST_DNS_CONF="port=53535\nlisten-address=127.0.0.1\nbind-interfaces\n"
-for domain in "${WHITELIST_DOMAINS[@]}"; do
-    clean_domain=$(echo "$domain" | sed 's/^\*\.//')
-    HOST_DNS_CONF="${HOST_DNS_CONF}ipset=/${clean_domain}/whitelist_ips_dynamic\n"
+DNS_CONF="port=53535\nlisten-address=127.0.0.1\nbind-interfaces\n"
+for d in "${WHITELIST_DOMAINS[@]}"; do
+    c=$(echo "$d" | sed 's/^\*\.//')
+    DNS_CONF="${DNS_CONF}ipset=/${c}/whitelist_ips_dynamic\n"
 done
-HOST_DNS_CONF="${HOST_DNS_CONF}server=8.8.8.8\nserver=1.1.1.1\n"
-printf "$HOST_DNS_CONF" > /etc/dnsmasq.d/dynamic_whitelist.conf
+for d in "${BLACKLIST_DOMAINS[@]}"; do
+    c=$(echo "$d" | sed 's/^\*\.//')
+    DNS_CONF="${DNS_CONF}address=/${c}/0.0.0.0\n"
+done
+DNS_CONF="${DNS_CONF}server=8.8.8.8\nserver=1.1.1.1\n"
+printf "$DNS_CONF" > /etc/dnsmasq.d/dynamic_whitelist.conf
+systemctl restart dnsmasq >/dev/null 2>&1 || systemctl start dnsmasq >/dev/null 2>&1 || true
+log "宿主 dnsmasq 已配置（127.0.0.1:53535）"
 
-systemctl restart dnsmasq || systemctl start dnsmasq
+# 注意：不修改 /etc/resolv.conf。若该文件是 bind 挂载，rm 会 EBUSY；
+# 且机票 runtime 依赖厂商 agent 写入的内容。
 
+# ---------------------------------------------------------------- CN IP 库
 mkdir -p "$CONF_DIR"
-curl -sLf https://cdn.jsdelivr.net/gh/ipverse/country-ip-blocks@master/country/cn/ipv4-aggregated.txt | tr -d '\r' | awk '/^[0-9]/ {print "add cnip " $1}' > "$CONF_DIR/cnip.list"
-
-cat << EOF > "$CONF_DIR/whitelist.conf"
-WHITELIST_DOMAINS=(
-$(printf "    \"%s\"\n" "${WHITELIST_DOMAINS[@]}")
-)
-WHITELIST_IPS=(
-$(printf "    \"%s\"\n" "${WHITELIST_IPS[@]}")
-)
-EOF
-
-if command -v incus &>/dev/null; then
-    incus network set incusbr0 raw.dnsmasq= >/dev/null 2>&1 || true
-    RAW_DNSMASQ_CONF=""
-    for domain in "${WHITELIST_DOMAINS[@]}"; do
-        clean_domain=$(echo "$domain" | sed 's/^\*\.//')
-        RAW_DNSMASQ_CONF="${RAW_DNSMASQ_CONF}ipset=/${clean_domain}/whitelist_ips_dynamic\n"
-    done
-    printf "$RAW_DNSMASQ_CONF" | incus network set incusbr0 raw.dnsmasq=- || true
-fi
-
-# =======================================================================
-# ⚙️ 生成核心自愈脚本 (保留所有精准大扫除，确保部署时环境绝对干净)
-# =======================================================================
-cat << 'INIT' > "$INIT_SCRIPT"
-#!/bin/bash
-CONF_DIR="/etc/iptables-custom"
-
-sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-
-if [ -f "$CONF_DIR/whitelist.conf" ]; then
-    source "$CONF_DIR/whitelist.conf"
-fi
-
-ipset create cnip hash:net 2>/dev/null || ipset flush cnip
-if [ -f "$CONF_DIR/cnip.list" ]; then
-    ipset restore < "$CONF_DIR/cnip.list"
-fi
-
-ipset create whitelist_ips_static hash:net 2>/dev/null || ipset flush whitelist_ips_static
-ipset create whitelist_ips_dynamic hash:net 2>/dev/null || true
-
-NEW_IPS=""
-for domain in "${WHITELIST_DOMAINS[@]}"; do
-    clean_domain=$(echo "$domain" | sed 's/^\*\.//')
-    ips=$(dig +short "$clean_domain" 2>/dev/null | grep -E '^[0-9.]+$') || true
-    if [ -n "$ips" ]; then
-        NEW_IPS="${NEW_IPS}\n${ips}"
+TMP_IP=$(mktemp)
+if curl -sLf --max-time 60 "$CNIP_URL" 2>/dev/null | tr -d '\r' | awk '/^[0-9]/ {print "add cnip " $1}' > "$TMP_IP"; then
+    n=$(wc -l < "$TMP_IP")
+    if [ "${n:-0}" -ge 1000 ]; then
+        mv -f "$TMP_IP" "${CONF_DIR}/cnip.list"
+        log "CN IP 库写入 ${n} 条"
+    else
+        log "CN IP 库条数异常(${n})，保留旧文件"
     fi
-done
+else
+    log "CN IP 库拉取失败，保留旧文件"
+fi
+rm -f "$TMP_IP"
 
-if echo -e "$NEW_IPS" | grep -qE '^[0-9.]+$'; then
-    echo -e "$NEW_IPS" | grep -E '^[0-9.]+$' | sort -u > "$CONF_DIR/static_ips.cache"
+# ---------------------------------------------------------------- whitelist.conf
+{
+    echo "WHITELIST_DOMAINS=("
+    printf '    "%s"\n' "${WHITELIST_DOMAINS[@]}"
+    echo ")"
+    echo "WHITELIST_IPS=("
+    printf '    "%s"\n' "${WHITELIST_IPS[@]}"
+    echo ")"
+    echo "BLOCK_OUT_PORTS=\"$BLOCK_OUT_PORTS\""
+} > "${CONF_DIR}/whitelist.conf"
+
+# ---------------------------------------------------------------- incusbr0 DNS
+if command -v incus >/dev/null 2>&1; then
+    RAW=""
+    for d in "${WHITELIST_DOMAINS[@]}"; do
+        c=$(echo "$d" | sed 's/^\*\.//')
+        RAW="${RAW}ipset=/${c}/whitelist_ips_dynamic\n"
+    done
+    for d in "${BLACKLIST_DOMAINS[@]}"; do
+        c=$(echo "$d" | sed 's/^\*\.//')
+        RAW="${RAW}address=/${c}/0.0.0.0\n"
+    done
+    printf "$RAW" | incus network set incusbr0 raw.dnsmasq=- >/dev/null 2>&1 || true
+    incus network set incusbr0 security.acls.default.egress.action=allow  >/dev/null 2>&1 || true
+    incus network set incusbr0 security.acls.default.ingress.action=allow >/dev/null 2>&1 || true
+    log "incusbr0 raw.dnsmasq 已下发"
 fi
 
-if [ -f "$CONF_DIR/static_ips.cache" ]; then
-    while read -r ip; do
-        [ -n "$ip" ] && ipset add whitelist_ips_static "$ip" 2>/dev/null || true
-    done < "$CONF_DIR/static_ips.cache"
+# ---------------------------------------------------------------- 安装执行体
+mkdir -p /usr/local/lib/incus-guard
+SRC_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -f "${SRC_DIR}/incus.sh" ]; then
+    install -m 755 "${SRC_DIR}/incus.sh" /usr/local/lib/incus-guard/incus.sh
+    log "执行体已从本地目录安装"
+elif curl -sLf --max-time 120 -o /usr/local/lib/incus-guard/incus.sh "$REMOTE_URL"; then
+    chmod 755 /usr/local/lib/incus-guard/incus.sh
+    log "执行体已从远端安装"
+else
+    echo "FATAL: 无法获得 incus.sh（本地无 ${SRC_DIR}/incus.sh，远端不可达）"
+    exit 1
 fi
+bash -n /usr/local/lib/incus-guard/incus.sh || { echo "FATAL: incus.sh 语法错误"; exit 1; }
+NEW_SHA=$(sha256sum /usr/local/lib/incus-guard/incus.sh | cut -d' ' -f1)
+log "执行体 sha256=${NEW_SHA}"
 
-for ip in "${WHITELIST_IPS[@]}"; do
-    ipset add whitelist_ips_static "$ip" 2>/dev/null || true
-done
-
-# === NAT 劫持防堆叠 ===
-while iptables -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p udp --dport 53 -m owner --uid-owner nobody -j ACCEPT 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p tcp --dport 53 -m owner --uid-owner nobody -j ACCEPT 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53535 2>/dev/null; do :; done
-while iptables -t nat -D OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports 53535 2>/dev/null; do :; done
-
-iptables -t nat -I OUTPUT 1 -p udp --dport 53 -j REDIRECT --to-ports 53535
-iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j REDIRECT --to-ports 53535
-iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -m owner --uid-owner nobody -j ACCEPT
-iptables -t nat -I OUTPUT 1 -p udp --dport 53 -m owner --uid-owner nobody -j ACCEPT
-iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT
-iptables -t nat -I OUTPUT 1 -p udp --dport 53 -m owner --uid-owner dnsmasq -j ACCEPT
-
-# === FILTER 链强力全量大清扫 ===
-while iptables -D INPUT -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D INPUT -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D INPUT -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D INPUT -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D OUTPUT -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT 2>/dev/null; do :; done
-while iptables -D FORWARD -i incusbr0 -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT 2>/dev/null; do :; done
-while iptables -D OUTPUT -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D OUTPUT -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D OUTPUT -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D OUTPUT -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D FORWARD -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D FORWARD -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D FORWARD -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D FORWARD -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT 2>/dev/null; do :; done
-while iptables -D OUTPUT -m set --match-set whitelist_ips_static dst -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -m set --match-set whitelist_ips_static dst -j ACCEPT 2>/dev/null; do :; done
-while iptables -D OUTPUT -m set --match-set whitelist_ips_dynamic dst -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -m set --match-set whitelist_ips_dynamic dst -j ACCEPT 2>/dev/null; do :; done
-
-# 🧹【强效补齐】：全量排空旧的通用放行安全垫规则
-while iptables -D FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -i incusbr0 -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -o incusbr0 -j ACCEPT 2>/dev/null; do :; done
-
-for domain in "${WHITELIST_DOMAINS[@]}"; do
-    clean_domain=$(echo "$domain" | sed 's/^\*\.//')
-    while iptables -D OUTPUT -p udp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D OUTPUT -p tcp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT 2>/dev/null; do :; done
-done
-
-# =======================================================================
-# 🧱【精密正序堆叠策略】：利用插入特性，越安全放底层的规则必须最先注入
-# =======================================================================
-
-# 🔥 建立基础通用转发与回包大门（最先插入，沉到最底部作为安全垫）
-iptables -I FORWARD 1 -o incusbr0 -j ACCEPT
-iptables -I FORWARD 1 -i incusbr0 -j ACCEPT
-iptables -I FORWARD 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# 第三顺位：下发中国 IP 强效拦截（沉在白名单下方）
-iptables -I OUTPUT 1 -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -m set --match-set cnip dst -m conntrack --ctstate NEW -j REJECT
-
-# 第四顺位：下发底层业务 IP 白名单放行（压在拦截上方）
-iptables -I OUTPUT 1 -m set --match-set whitelist_ips_dynamic dst -j ACCEPT
-iptables -I OUTPUT 1 -m set --match-set whitelist_ips_static dst -j ACCEPT
-iptables -I FORWARD 1 -m set --match-set whitelist_ips_dynamic dst -j ACCEPT
-iptables -I FORWARD 1 -m set --match-set whitelist_ips_static dst -j ACCEPT
-
-for domain in "${WHITELIST_DOMAINS[@]}"; do
-    clean_domain=$(echo "$domain" | sed 's/^\*\.//')
-    iptables -I OUTPUT 1 -p udp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT
-    iptables -I OUTPUT 1 -p tcp --dport 53 -m string --string "$clean_domain" --algo bm -j ACCEPT
-done
-
-# 第二顺位（绝对霸权）：下发大小写 DNS 域名终极斩杀线（压在最顶部）
-iptables -I OUTPUT 1 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I OUTPUT 1 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I OUTPUT 1 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-iptables -I OUTPUT 1 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-
-iptables -I FORWARD 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-iptables -I FORWARD 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-
-# 第一顺位：针对容器直接访问宿主网桥本地 DNS 的包，在 INPUT 链最顶部拦截！
-iptables -I INPUT 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I INPUT 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02636e00|" --algo bm -j REJECT
-iptables -I INPUT 1 -i incusbr0 -p tcp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
-iptables -I INPUT 1 -i incusbr0 -p udp --dport 53 -m string --hex-string "|02434e00|" --algo bm -j REJECT
+# ---------------------------------------------------------------- init.sh（开机复用）
+cat > "$INIT_SCRIPT" <<'INIT'
+#!/bin/bash
+# 开机恢复：调用同目录下的执行体逻辑（不带 --scan-only，只应用防火墙）
+LOCAL=/usr/local/lib/incus-guard/incus.sh
+if [ -x "$LOCAL" ]; then
+    exec "$LOCAL" --apply-only
+fi
+# 本地副本不存在时退回远端（含校验）
+exec /usr/local/bin/incus_cron.sh --apply-only
 INIT
+chmod 755 "$INIT_SCRIPT"
 
-chmod +x "$INIT_SCRIPT"
+# ---------------------------------------------------------------- wrapper
+cat > "$WRAPPER" <<'WRAP'
+#!/bin/bash
+# Incus 巡检执行体 wrapper（v3）
+#  - flock 防重入：上一轮没跑完，本轮直接跳过
+#  - 拉取远端脚本并做 sha256 pin（pin 填了就强制校验，不符不执行）
+#  - 失败 / 超时 / 崩溃一律写日志，不再静默
+WRAPPER_VERSION="3"
+LOG_FILE="/var/log/incus_clean.log"
+LOCAL_DIR="/usr/local/lib/incus-guard"
+LOCAL="$LOCAL_DIR/incus.sh"
+LOCK="/run/incus_guard.lock"
+URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
+PIN_SHA256=""
+# 远端更新开关：1 = 每轮拉远端并覆盖本地；0 = 只跑本地副本。
+# 首次部署保持 0（仓库里的 incus.sh 还是旧版），确认仓库已更新后可改为 1。
+ENABLE_REMOTE=0
+MAX_SECONDS=600
 
-cat << 'SERVICE' > /etc/systemd/system/custom-firewall.service
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+mkdir -p "$LOCAL_DIR"
+
+exec 9>"$LOCK"
+flock -n 9 || { echo "[$(date '+%F %T')] 上一轮未结束，跳过本轮" >> "$LOG_FILE"; exit 0; }
+
+TMP_OUT=$(mktemp); trap 'rm -f "$TMP_OUT"' EXIT
+START=$(date +%s)
+RC_NOTE=""
+
+# 只在开启远端更新时才拉取
+if [ "$ENABLE_REMOTE" = "1" ]; then
+    if ! curl -sLf --max-time 120 -H "Cache-Control: no-cache" -o "$LOCAL.tmp" "$URL"; then
+        echo "[$(date '+%F %T')] ⚠ 拉取 incus.sh 失败（网络或仓库不可达），改用本地副本" >> "$LOG_FILE"
+        rm -f "$LOCAL.tmp"
+        RC_NOTE="拉取失败"
+    elif [ -n "$PIN_SHA256" ]; then
+        if echo "$PIN_SHA256  $LOCAL.tmp" | sha256sum -c - >/dev/null 2>&1; then
+            mv -f "$LOCAL.tmp" "$LOCAL"
+        else
+            echo "[$(date '+%F %T')] ⚠ 远端 sha256 与 pin 不符，拒绝执行（沿用本地副本）" >> "$LOG_FILE"
+            rm -f "$LOCAL.tmp"
+            RC_NOTE="pin 不符"
+        fi
+    else
+        mv -f "$LOCAL.tmp" "$LOCAL"
+    fi
+fi
+
+[ -x "$LOCAL" ] || { echo "[$(date '+%F %T')] ⚠ 无可用 incus.sh，终止" >> "$LOG_FILE"; exit 1; }
+
+timeout "$MAX_SECONDS" bash "$LOCAL" > "$TMP_OUT" 2>&1
+RC=$?
+DUR=$(( $(date +%s) - START ))
+
+sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$TMP_OUT" | sed -E 's/\r/\n/g' > "$TMP_OUT.clean"
+
+# 事件入库
+if grep -qE "违规:|重装成功|重装失败|FATAL" "$TMP_OUT.clean" 2>/dev/null; then
+    if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 102400 ]; then
+        tail -n 300 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        echo "--- $(date '+%F %T') 日志超 100KB 已裁剪" >> "$LOG_FILE"
+    fi
+    echo "=== [$(date '+%F %T')] 🚨 巡检事件（rc=$RC 耗时=${DUR}s） ===" >> "$LOG_FILE"
+    grep -E "违规:|重装成功|重装失败|FATAL" "$TMP_OUT.clean" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+fi
+
+# 异常兜底：非零退出、超时、或明显过慢都要留痕
+if [ "$RC" -ne 0 ] || [ "$DUR" -gt 300 ]; then
+    echo "[$(date '+%F %T')] ⚠ 巡检异常 rc=$RC 耗时=${DUR}s ${RC_NOTE}" >> "$LOG_FILE"
+    tail -n 20 "$TMP_OUT.clean" >> "$LOG_FILE" 2>/dev/null
+fi
+
+rm -f "$TMP_OUT.clean"
+exit 0
+WRAP
+
+bash -n "$WRAPPER" || { echo "FATAL: wrapper 语法错误"; exit 1; }
+chmod 755 "$WRAPPER"
+
+# ---------------------------------------------------------------- systemd
+cat > /etc/systemd/system/custom-firewall.service <<'SERVICE'
 [Unit]
-Description=Custom Outbound Firewall for Host and Incus Containers
+Description=Custom Outbound Firewall for Host and Incus Containers (incus-guard)
 After=network-online.target
 Wants=network-online.target
 
@@ -247,47 +270,29 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/etc/iptables-custom/init.sh
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-systemctl enable custom-firewall.service
+systemctl enable custom-firewall.service >/dev/null 2>&1 || true
 
-# 启动服务（服务内已包含 init.sh 的执行，无需重复运行）
-systemctl restart custom-firewall.service
+# ---------------------------------------------------------------- cron
+OLD=$(crontab -l 2>/dev/null | grep -v "incus_cron.sh" || true)
+printf "%s\n*/5 * * * * %s\n" "$OLD" "$WRAPPER" | grep -v '^$' | crontab -
+log "crontab 已写入（每 5 分钟）"
 
-echo -e "\n=================================================="
-echo "⏰ 第二阶段：配置高频安全检测定时任务 (Crontab)"
-echo "=================================================="
-
-cat << 'EOF' > "$CRON_SCRIPT"
-#!/bin/bash
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
-
-LOG_FILE="/var/log/incus_clean.log"
-TMP_OUT=$(mktemp)
-CLEAN_OUT=$(mktemp)
-trap 'rm -f "$TMP_OUT" "$CLEAN_OUT"' EXIT
-
-timeout 10m bash -c 'curl -sLf -H "Cache-Control: no-cache" -H "Pragma: no-cache" "https://raw.githubusercontent.com/2113087020/incus/main/incus.sh?v=$(date +%s)" | bash' > "$TMP_OUT" 2>&1
-sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$TMP_OUT" | sed -E 's/\r/\n/g' > "$CLEAN_OUT"
-
-if grep -qE "违规:|发现违规|重装成功" "$CLEAN_OUT"; then
-    if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -gt 102400 ]; then
-        tail -n 300 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
-        echo "--- $(date '+%Y-%m-%d %H:%M:%S') 日志超 100KB 已自动裁剪矩阵 ---" >> "$LOG_FILE"
-    fi
-    echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] 🚨 Incus 容器自动重装自愈事件报告 ===" >> "$LOG_FILE"
-    grep -E "违规:|发现违规|正在强制|重装成功|重装失败" "$CLEAN_OUT" >> "$LOG_FILE"
-    echo "" >> "$LOG_FILE"
-fi
-EOF
-
-chmod +x "$CRON_SCRIPT"
-OLD_CRON=$(crontab -l 2>/dev/null | grep -v "incus_cron.sh" || true)
-printf "%s\n*/5 * * * * %s\n" "$OLD_CRON" "$CRON_SCRIPT" | grep -v '^$' | crontab -
+# ---------------------------------------------------------------- 立即应用
+log "执行首轮应用..."
+bash "$WRAPPER"
+log "首轮完成，最近日志："
+tail -n 15 "$LOG_FILE" 2>/dev/null || true
 
 echo "------------------------------------------------"
-echo "✅ 全套一体化安全配置部署完成！后续修改白名单只需重新运行本脚本即可更新状态。"
+log "部署完成。"
+log "  巡检：$WRAPPER（手动跑：$WRAPPER）"
+log "  仅防火墙：$WRAPPER 里那份 incus.sh 支持 --apply-only"
+log "  只扫描不重装：bash /usr/local/lib/incus-guard/incus.sh --scan-only"
+log "  日志：$LOG_FILE"
