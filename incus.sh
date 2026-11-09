@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.2.3  用法：incus.sh [--apply-only|--scan-only]
+# v6.2.4  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -27,7 +27,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.3"
+SCRIPT_VERSION="6.2.4"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -189,6 +189,28 @@ cleanup_legacy_dns_hijack() {
     return 0
 }
 
+# 清掉旧版（v6.0.0 及更早）直接塞在系统链里的 ipset 规则。
+# 它们会一直留着：既重复豁免，又让对应 ipset 永远无法 destroy（References 归零不了）。
+cleanup_legacy_rules() {
+    local ipt ch set line spec n=0
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        for ch in FORWARD OUTPUT INPUT; do
+            for set in cnip cnip6 geo_v4 geo_v6 whitelist_ips_dynamic whitelist_ips_dynamic6 \
+                       whitelist_ips_static whitelist_ips_static6; do
+                while line=$($ipt -S "$ch" 2>/dev/null | grep -m1 -- "-m set --match-set $set "); do
+                    spec="${line#-A $ch }"
+                    # shellcheck disable=SC2086
+                    $ipt -D "$ch" $spec 2>/dev/null || break
+                    n=$((n+1))
+                done
+            done
+        done
+    done
+    [ "$n" -gt 0 ] && log "已清理旧版残留在系统链里的 ${n} 条 ipset 规则"
+    return 0
+}
+
 # CN IP 库：缺失或超 24h 才拉；条数达标才落地，绝不用空库覆盖旧库
 sync_cnip_list() {
     local url=$1 list=$2 min=$3 setname=$4
@@ -284,6 +306,8 @@ ensure_dynamic_set() {
 }
 
 sync_ipsets() {
+    # 先清残留：旧版直接写在 FORWARD/OUTPUT 的 ipset 规则会让 destroy 永远失败
+    cleanup_legacy_rules
     ipset create cnip hash:net 2>/dev/null || ipset flush cnip
     [ -s "$CNIP_LIST" ] && ipset restore -exist < "$CNIP_LIST" 2>/dev/null || true
 
