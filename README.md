@@ -1,4 +1,4 @@
-# Incus 宿主安全一体化脚本 v6.1.1
+# Incus 宿主安全一体化脚本 v6.1.2
 
 违规巡检自愈 + 拦截出站 CN 请求 + 防送中（Google/Apple 等定位上报）。
 
@@ -107,7 +107,8 @@ INPUT   → INCUS_GUARD_IN (第 1 位)
 - **crontab 写保护**：读现有 crontab 失败（不只是「no crontab」）时直接中止，
   不再可能写入空表把别人的定时任务清掉；写后读回校验。
 - **应用前快照**：`/etc/iptables-custom/snapshot-<时间戳>.rules`，保留最近 3 份。
-- **logrotate**：`size 5M × 4 + compress`，替代原来只会在有事件时才触发的内联裁剪。
+- **日志只留 200 行**：wrapper 每轮把 `/var/log/incus_clean.log` 裁到最近 200 行，
+  不再用 logrotate，翻日志一眼到底。
 - **超时 240s**：小于 cron 的 300s 间隔，不会再出现一轮吃掉下一轮。
 - **首轮返回码**：部署结束按首轮真实 rc 退出并明示成功/失败。
 - **名字版本号单一**：`WRAPPER_VERSION` 由部署脚本变量注入，不再有两处写死。

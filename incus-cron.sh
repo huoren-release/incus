@@ -1,6 +1,6 @@
 #!/bin/bash
 # =======================================================================
-# Incus 宿主网络安全一体化部署脚本 v6.1.1
+# Incus 宿主网络安全一体化部署脚本 v6.1.2
 #   1) 装依赖（失败才动镜像源，成功绝不动）
 #   2) 写唯一名单 whitelist.conf（incus.sh 直接 source，不再各写一份）
 #   3) 生成定时执行体 wrapper（flock、远端更新、sha256 pin、退出码告警）
@@ -10,7 +10,7 @@
 #     宿主 CN 拦截按 IP 网段做，不再有「dnsmasq 挂了宿主 DNS 全废」的故障点
 #   - 名单单一来源 whitelist.conf，补齐测速/延迟检测域名
 #   - crontab 写入前校验读回，读失败直接中止（不再可能清空别人的 cron）
-#   - 应用前保存 iptables 快照（保留 3 份）、加 logrotate、加 --uninstall
+#   - 应用前保存 iptables 快照（保留 3 份）、日志每轮裁到 200 行、加 --uninstall
 #   - wrapper 透传参数（--apply-only 终于有效）、默认远端更新、超时 240s
 # 用法：bash incus-cron.sh [--apply-only|--scan-only|--uninstall|--pin]
 # =======================================================================
@@ -21,7 +21,7 @@ CONF_DIR="/etc/iptables-custom"
 INIT_SCRIPT="${CONF_DIR}/init.sh"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
 WRAPPER="/usr/local/bin/incus_cron.sh"
-WRAPPER_VERSION="5"
+WRAPPER_VERSION="6"
 LOG_FILE="/var/log/incus_clean.log"
 REMOTE_URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
 CNIP_URL="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/cn/ipv4-aggregated.txt"
@@ -312,10 +312,6 @@ sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$TMP_OUT" | sed -E 's/\r/\n/g' > "$TMP_OUT.
 
 # 事件入库
 if grep -qE "违规:|重装成功|重装失败|FATAL" "$TMP_OUT.clean" 2>/dev/null; then
-    if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 102400 ]; then
-        tail -n 300 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv -f "${LOG_FILE}.tmp" "$LOG_FILE"
-        echo "--- $(date '+%F %T') 日志超 100KB 已裁剪" >> "$LOG_FILE"
-    fi
     echo "=== [$(date '+%F %T')] 🚨 巡检事件（rc=$RC 耗时=${DUR}s） ===" >> "$LOG_FILE"
     grep -E "违规:|重装成功|重装失败|FATAL" "$TMP_OUT.clean" >> "$LOG_FILE"
     echo "" >> "$LOG_FILE"
@@ -325,6 +321,11 @@ fi
 if [ "$RC" -ne 0 ] || [ "$DUR" -gt 200 ]; then
     echo "[$(date '+%F %T')] ⚠ 巡检异常 rc=$RC 耗时=${DUR}s ${RC_NOTE}" >> "$LOG_FILE"
     tail -n 20 "$TMP_OUT.clean" >> "$LOG_FILE" 2>/dev/null
+fi
+
+# 日志只保留最近 200 行，翻起来一眼到底
+if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)" -gt 200 ]; then
+    tail -n 200 "$LOG_FILE" > "${LOG_FILE}.trim" && mv -f "${LOG_FILE}.trim" "$LOG_FILE"
 fi
 
 [ "$RC" -eq 0 ] && exit 0
@@ -341,18 +342,9 @@ fi
 bash -n "$WRAPPER" || { echo "FATAL: wrapper 语法错误"; exit 1; }
 chmod 755 "$WRAPPER"
 
-# ================================================================ logrotate
-cat > /etc/logrotate.d/incus-guard <<'LR'
-/var/log/incus_clean.log {
-    size 5M
-    rotate 4
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-LR
+# ================================================================ 日志
+# 不再用 logrotate：wrapper 每轮把日志裁到 200 行，直接 tail 就能看到头
+rm -f /etc/logrotate.d/incus-guard 2>/dev/null || true
 
 # ================================================================ systemd
 cat > /etc/systemd/system/custom-firewall.service <<'SERVICE'
@@ -426,6 +418,6 @@ log "  巡检：$WRAPPER（每 5 分钟，手动跑：$WRAPPER）"
 log "  只应用防火墙：$WRAPPER --apply-only"
 log "  只扫描不重装：$WRAPPER --scan-only"
 log "  卸载：bash $0 --uninstall"
-log "  日志：$LOG_FILE（logrotate 5M×4）"
+log "  日志：$LOG_FILE（每轮裁到 200 行）"
 log "  名单：$GUARD_CONF"
 exit "$RC"
