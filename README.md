@@ -1,4 +1,4 @@
-# Incus 宿主安全一体化脚本 v6.1.5
+# Incus 宿主安全一体化脚本 v6.2.0
 
 违规巡检自愈 + 拦截出站 CN 请求 + 防送中（Google/Apple 等定位上报）。
 
@@ -13,8 +13,8 @@
 
 ```bash
 mkdir -p /root/iguard-src && cd /root/iguard-src
-curl -fsSL -o incus.sh      https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh
-curl -fsSL -o incus-cron.sh https://raw.githubusercontent.com/huoren-release/incus/main/incus-cron.sh
+# 用 codeload tarball：raw.githubusercontent.com 会返回 CDN 缓存旧版本
+curl -fsSL https://codeload.github.com/huoren-release/incus/tar.gz/refs/heads/main | tar xz --strip-components=1
 bash incus-cron.sh
 ```
 
@@ -91,6 +91,25 @@ INPUT   → INCUS_GUARD_IN (第 1 位)
 
 升级时会自动清理旧版留下的 nat 规则与 `/etc/dnsmasq.d/dynamic_whitelist.conf`，
 并在确认该配置没有别的用途后 `systemctl disable --now dnsmasq`。
+
+## 关键修复点（v6.2.0）
+
+- **重装镜像按容器自己的基础镜像挑**：先看 `volatile.base_image` 是否在本地，
+  再看 `image.os` 是否有同发行版镜像；都没有就**拒绝处置**并告警。
+  v6.1.x 回退到 `images:<distro>/latest`，那个别名并不存在 —— 实测
+  `incus image copy images:alpine/latest` 直接报 `The requested image couldn't be found`，
+  而 `incus rebuild` 是**先停容器再取镜像**，取不到就把容器留在 STOPPED（ACCK 上真发生过）。
+- **重装后回读状态**：不是 RUNNING 就 `incus start` 补一次，仍不行打 `FATAL`。
+- **重装失败带原因**：捕获 incus 的 stderr 写进日志（以前 `2>/dev/null` 全丢，
+  只留一句「重装失败」，没人知道为什么）。
+- **wrapper 超时 240 → 900s**：脚本内单次 rebuild 上限 300s，超时比它短会把 rebuild 打断。
+- **白名单静态池先解析到临时集合、条数达标才 swap**：DNS 抖动那几分钟不会把池子清空。
+- **动态白名单池带 2h 默认超时**：dnsmasq 只加不减，以前 IP 换主后老地址永久豁免 CN 拦截。
+- **IPv6 双栈**：`ip6tables` 建同名自有链，`cnip6`（ipverse v6 段）+ `geo_v6` 一并拦截。
+  以前 `ip6tables -S | grep INCUS` 是 0 条，容器走 v6 能完全绕过。
+- **关键词只匹配参数的文件名部分**：`/etc/prometheus/x.yml` 这类路径不再误伤容器。
+- **扫描失败不再算「正常」**：容器没 `/proc/net/tcp`、`incus exec` 超时/失败都会单独计数。
+- **apt 源只在解析/连接失败时才切**：dpkg 锁冲突这类临时错误不再永久改写系统源。
 
 ## 关键修复点（v6.1.0）
 

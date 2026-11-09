@@ -1,6 +1,6 @@
 #!/bin/bash
 # =======================================================================
-# Incus 宿主网络安全一体化部署脚本 v6.1.5
+# Incus 宿主网络安全一体化部署脚本 v6.2.0
 #   1) 装依赖（失败才动镜像源，成功绝不动）
 #   2) 写唯一名单 whitelist.conf（incus.sh 直接 source，不再各写一份）
 #   3) 生成定时执行体 wrapper（flock、远端更新、sha256 pin、退出码告警）
@@ -21,10 +21,11 @@ CONF_DIR="/etc/iptables-custom"
 INIT_SCRIPT="${CONF_DIR}/init.sh"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
 WRAPPER="/usr/local/bin/incus_cron.sh"
-WRAPPER_VERSION="6"
+WRAPPER_VERSION="7"
 LOG_FILE="/var/log/incus_clean.log"
 REMOTE_URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
 CNIP_URL="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/cn/ipv4-aggregated.txt"
+CNIP6_URL="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/cn/ipv6-aggregated.txt"
 
 # 远端脚本的 sha256 pin：留空 = 跟随 main 分支；填了就只执行哈希匹配的版本。
 # 用 --pin 参数可在部署时把 pin 锁成「当前安装的这一份」。
@@ -62,6 +63,13 @@ WHITELIST_IPS=(
     "1.1.1.1" "1.0.0.1" "8.8.8.8" "8.8.4.4" "9.9.9.9" "208.67.222.222"
 )
 
+# IPv6 也要放行，否则 v6 侧白名单里的解析器自己就被拦了
+WHITELIST_IPS6=(
+    "2606:4700:4700::1111" "2606:4700:4700::1001"
+    "2001:4860:4860::8888" "2001:4860:4860::8844"
+    "2620:fe::fe" "2620:119:35::35"
+)
+
 BLACKLIST_DOMAINS=(
     "baidu.com" "taobao.com" "qq.com" "jd.com" "bilibili.com" "163.com"
     "weibo.com" "zhihu.com" "douyin.com" "kuaishou.com" "alipay.com"
@@ -97,12 +105,15 @@ do_uninstall() {
     fi
     rm -f "$tmp"
 
-    for ch in INCUS_GUARD INCUS_GUARD_OUT INCUS_GUARD_IN; do
-        iptables -D FORWARD -j "$ch" 2>/dev/null
-        iptables -D OUTPUT  -j "$ch" 2>/dev/null
-        iptables -D INPUT   -j "$ch" 2>/dev/null
-        iptables -F "$ch" 2>/dev/null
-        iptables -X "$ch" 2>/dev/null
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        for ch in INCUS_GUARD INCUS_GUARD_OUT INCUS_GUARD_IN; do
+            "$ipt" -D FORWARD -j "$ch" 2>/dev/null
+            "$ipt" -D OUTPUT  -j "$ch" 2>/dev/null
+            "$ipt" -D INPUT   -j "$ch" 2>/dev/null
+            "$ipt" -F "$ch" 2>/dev/null
+            "$ipt" -X "$ch" 2>/dev/null
+        done
     done
     iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53535 2>/dev/null
     iptables -t nat -D OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports 53535 2>/dev/null
@@ -110,6 +121,11 @@ do_uninstall() {
     ipset destroy geo_v4 2>/dev/null
     ipset destroy whitelist_ips_static 2>/dev/null
     ipset destroy whitelist_ips_dynamic 2>/dev/null
+    ipset destroy cnip6 2>/dev/null
+    ipset destroy geo_v6 2>/dev/null
+    ipset destroy geo_v6_tmp 2>/dev/null
+    ipset destroy whitelist_ips_static6 2>/dev/null
+    ipset destroy whitelist_ips_dynamic6 2>/dev/null
 
     systemctl disable --now custom-firewall.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/custom-firewall.service
@@ -162,19 +178,30 @@ fix_apt_mirror() {
 }
 
 pkg_install() {
-    # 先按现状装；只有装失败才动镜像源，成功后重试一次
+    # 只有「解析不到地址 / 连不上源」才动镜像源；dpkg 锁冲突、包冲突这类
+    # 临时或真实错误一律不改系统源（改完不还原，等于永久改别人机器）
+    local out
+    out=$(mktemp)
     apt-get update -yq >/dev/null 2>&1 || true
     # shellcheck disable=SC2086
     if apt-get install -yq -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" $PKGS >/dev/null 2>&1; then
-        return 0
+        -o Dpkg::Options::="--force-confold" $PKGS > "$out" 2>&1; then
+        rm -f "$out"; return 0
     fi
-    log "依赖安装失败，切换官方镜像源后重试"
-    fix_apt_mirror
-    apt-get update -yq >/dev/null 2>&1 || true
-    # shellcheck disable=SC2086
-    apt-get install -yq -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" $PKGS >/dev/null 2>&1
+    if grep -qiE 'Could not resolve|Temporary failure resolving|Network is unreachable|Failed to fetch.*(Connection|resolve)' "$out"; then
+        log "依赖安装失败（域名解析/连接失败），切换官方镜像源后重试"
+        fix_apt_mirror
+        apt-get update -yq >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        apt-get install -yq -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" $PKGS >/dev/null 2>&1
+        local rc=$?
+        rm -f "$out"
+        return $rc
+    fi
+    log "依赖安装失败（非镜像源问题，未改动 apt 源）：$(tail -n 3 "$out" | tr '\n' ' ')"
+    rm -f "$out"
+    return 1
 }
 
 pkg_install || log "⚠ 依赖安装未完全成功，继续尝试（缺什么会在运行时日志里报出来）"
@@ -195,6 +222,9 @@ mkdir -p "$CONF_DIR"
     echo "WHITELIST_IPS=("
     printf '    "%s"\n' "${WHITELIST_IPS[@]}"
     echo ")"
+    echo "WHITELIST_IPS6=("
+    printf '    "%s"\n' "${WHITELIST_IPS6[@]}"
+    echo ")"
     echo "BLACKLIST_DOMAINS=("
     printf '    "%s"\n' "${BLACKLIST_DOMAINS[@]}"
     echo ")"
@@ -202,20 +232,27 @@ mkdir -p "$CONF_DIR"
 } > "$GUARD_CONF"
 log "名单已写入 $GUARD_CONF（白名单 $(printf '%s\n' "${WHITELIST_DOMAINS[@]}" | sed '/^$/d' | sort -u | wc -l) 个域名）"
 
-# ================================================================ CN IP 库
-TMP_IP=$(mktemp)
-if curl -sLf --max-time 60 "$CNIP_URL" 2>/dev/null | tr -d '\r' | awk '/^[0-9]/ {print "add cnip " $1}' > "$TMP_IP"; then
-    n=$(wc -l < "$TMP_IP")
-    if [ "${n:-0}" -ge 1000 ]; then
-        mv -f "$TMP_IP" "${CONF_DIR}/cnip.list"
-        log "CN IP 库写入 ${n} 条"
+# ================================================================ CN IP 库（v4 + v6）
+fetch_cnip() {
+    local url=$1 dest=$2 min=$3 setname=$4 tmp n
+    tmp=$(mktemp)
+    if curl -sLf --max-time 60 "$url" 2>/dev/null | tr -d '\r' \
+        | awk -v s="$setname" '/^[0-9a-fA-F:.]+(\/[0-9]+)?$/ {print "add " s " " $1}' > "$tmp"; then
+        n=$(wc -l < "$tmp")
+        if [ "${n:-0}" -ge "$min" ]; then
+            mv -f "$tmp" "$dest"
+            log "CN 库 $setname 写入 ${n} 条"
+            return 0
+        fi
+        log "CN 库 $setname 条数异常(${n})，保留旧文件"
     else
-        log "CN IP 库条数异常(${n})，保留旧文件"
+        log "CN 库 $setname 拉取失败，保留旧文件"
     fi
-else
-    log "CN IP 库拉取失败，保留旧文件"
-fi
-rm -f "$TMP_IP"
+    rm -f "$tmp"
+    return 1
+}
+fetch_cnip "$CNIP_URL"  "${CONF_DIR}/cnip.list"  1000 cnip
+fetch_cnip "$CNIP6_URL" "${CONF_DIR}/cnip6.list" 100  cnip6
 
 # ================================================================ 安装执行体
 mkdir -p /usr/local/lib/incus-guard
@@ -254,7 +291,7 @@ cat > "$WRAPPER" <<'WRAP'
 # Incus 巡检执行体 wrapper
 #  - flock 防重入：上一轮没跑完，本轮直接跳过
 #  - 参数原样透传给 incus.sh（--apply-only / --scan-only 都有效）
-#  - 远端更新：拉取后先 bash -n，再按 PIN_SHA256 校验（pin 为空则跳过校验）
+#  - 超时 900s：脚本里单次 rebuild 最长 300s，超时必须比它长，否则会把 rebuild 打断
 #  - 失败 / 超时 / 拉取异常一律写日志，不再静默
 WRAPPER_VERSION="@V@"
 LOG_FILE="/var/log/incus_clean.log"
@@ -265,7 +302,7 @@ URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
 PIN_SHA256="@P@"
 # 远端更新开关：1 = 每轮拉远端并覆盖本地；0 = 只跑本地副本
 ENABLE_REMOTE=1
-MAX_SECONDS=240
+MAX_SECONDS=900
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 mkdir -p "$LOCAL_DIR"
