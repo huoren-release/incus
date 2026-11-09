@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.1.0  用法：incus.sh [--apply-only|--scan-only]
+# v6.1.1  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -20,6 +20,9 @@
 # =======================================================================
 
 set -uo pipefail
+
+# 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
+SCRIPT_VERSION="6.1.1"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -99,7 +102,7 @@ IPSET_GEO4="geo_v4"
 CNIP_LIST="${CONF_DIR}/cnip.list"
 LOG_FILE="/var/log/incus_clean.log"
 WRAPPER="/usr/local/bin/incus_cron.sh"
-WRAPPER_VERSION="4"
+WRAPPER_VERSION="5"
 CH_GUARD="INCUS_GUARD"
 CH_GUARD_OUT="INCUS_GUARD_OUT"
 CH_GUARD_IN="INCUS_GUARD_IN"

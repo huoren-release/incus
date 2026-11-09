@@ -1,4 +1,4 @@
-# Incus 宿主安全一体化脚本 v6.1.0
+# Incus 宿主安全一体化脚本 v6.1.1
 
 违规巡检自愈 + 拦截出站 CN 请求 + 防送中（Google/Apple 等定位上报）。
 
@@ -94,6 +94,8 @@ INPUT   → INCUS_GUARD_IN (第 1 位)
 
 ## 关键修复点（v6.1.0）
 
+- **只升不降**：wrapper 拉远端后比较两侧 `SCRIPT_VERSION`，远端版本更低就拒绝覆盖
+  （raw.githubusercontent 的 CDN 缓存能滞后好几分钟，会把刚装好的新脚本换回旧版）。
 - **wrapper 透传参数**：`--apply-only` / `--scan-only` 现在真的生效；
   旧版参数被吞，开机兜底 `init.sh` 会退化成全量扫描甚至重装容器。
 - **默认远端更新** `ENABLE_REMOTE=1`：每轮拉 `main`，先 `bash -n` 语法门禁，

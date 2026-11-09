@@ -1,6 +1,6 @@
 #!/bin/bash
 # =======================================================================
-# Incus 宿主网络安全一体化部署脚本 v6.1.0
+# Incus 宿主网络安全一体化部署脚本 v6.1.1
 #   1) 装依赖（失败才动镜像源，成功绝不动）
 #   2) 写唯一名单 whitelist.conf（incus.sh 直接 source，不再各写一份）
 #   3) 生成定时执行体 wrapper（flock、远端更新、sha256 pin、退出码告警）
@@ -21,7 +21,7 @@ CONF_DIR="/etc/iptables-custom"
 INIT_SCRIPT="${CONF_DIR}/init.sh"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
 WRAPPER="/usr/local/bin/incus_cron.sh"
-WRAPPER_VERSION="4"
+WRAPPER_VERSION="5"
 LOG_FILE="/var/log/incus_clean.log"
 REMOTE_URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
 CNIP_URL="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/cn/ipv4-aggregated.txt"
@@ -267,6 +267,9 @@ MAX_SECONDS=240
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 mkdir -p "$LOCAL_DIR"
 
+# 取脚本内 SCRIPT_VERSION（旧版没有这个变量，返回空）
+ver_of() { grep -m1 '^SCRIPT_VERSION=' "$1" 2>/dev/null | cut -d'"' -f2; }
+
 exec 9>"$LOCK"
 flock -n 9 || { echo "[$(date '+%F %T')] 上一轮未结束，跳过本轮" >> "$LOG_FILE"; exit 0; }
 
@@ -283,6 +286,12 @@ if [ "$ENABLE_REMOTE" = "1" ]; then
         echo "[$(date '+%F %T')] ⚠ 远端 incus.sh 语法错误，拒绝执行（沿用本地副本）" >> "$LOG_FILE"
         rm -f "$LOCAL.tmp"
         RC_NOTE="语法错误"
+    elif [ -n "$(ver_of "$LOCAL")" ] && \
+         [ "$(printf '%s\n%s\n' "$(ver_of "$LOCAL.tmp")" "$(ver_of "$LOCAL")" | sort -V | tail -n1)" = "$(ver_of "$LOCAL")" ] && \
+         [ "$(ver_of "$LOCAL.tmp")" != "$(ver_of "$LOCAL")" ]; then
+        echo "[$(date '+%F %T')] ⚠ 远端版本 $(ver_of "$LOCAL.tmp") 低于本地 $(ver_of "$LOCAL")，拒绝降级（CDN 缓存或误回退）" >> "$LOG_FILE"
+        rm -f "$LOCAL.tmp"
+        RC_NOTE="远端版本较低"
     elif [ -n "$PIN_SHA256" ] && ! echo "$PIN_SHA256  $LOCAL.tmp" | sha256sum -c - >/dev/null 2>&1; then
         echo "[$(date '+%F %T')] ⚠ 远端 sha256 与 pin 不符，拒绝执行（沿用本地副本）" >> "$LOG_FILE"
         rm -f "$LOCAL.tmp"
