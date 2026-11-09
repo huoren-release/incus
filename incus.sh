@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.1.2  用法：incus.sh [--apply-only|--scan-only]
+# v6.1.3  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -22,7 +22,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.1.2"
+SCRIPT_VERSION="6.1.3"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -210,30 +210,35 @@ sync_ipsets() {
     ipset create whitelist_ips_static hash:net 2>/dev/null || ipset flush whitelist_ips_static
     ipset create whitelist_ips_dynamic hash:net 2>/dev/null || true
 
-    local ip d
+    local ip
+    # 白名单域名的解析交给容器侧 dnsmasq 的 ipset= 指令实时填充 dynamic 集合，
+    # 这里只放手工指定的 IP，避免每轮 dig 几十个域名拖慢巡检。
     for ip in "${WHITELIST_IPS[@]}"; do
         ipset add whitelist_ips_static "$ip" -exist 2>/dev/null || true
-    done
-    for d in $(uniq_wl_domains); do
-        for ip in $(dig +short +time=2 +tries=1 "$d" A 2>/dev/null | grep -E '^[0-9.]+$'); do
-            ipset add whitelist_ips_static "$ip" -exist 2>/dev/null || true
-        done
     done
     return 0
 }
 
 # 定位目标池：临时集合填满后 swap，原子替换；解析全失败则保留旧集合
+# 44 个查询并发跑（单个 +time=1），慢 DNS 的机器上也不会拖到几十秒
 refresh_geo_ipset() {
-    local t4="${IPSET_GEO4}_tmp" d r ip cnt=0
+    local t4="${IPSET_GEO4}_tmp" d r ip out cnt=0
     ipset create "$t4" hash:ip family inet maxelem 65536 -exist
     ipset flush "$t4"
+    out=$(mktemp)
     for d in $GEO_DOMAINS; do
         for r in $GEO_RESOLVERS; do
-            for ip in $(dig +short +time=2 +tries=1 "@$r" A "$d" 2>/dev/null | grep -E '^[0-9.]+$'); do
-                ipset add "$t4" "$ip" -exist 2>/dev/null && cnt=$((cnt+1))
-            done
+            ( dig +short +time=1 +tries=1 "@$r" A "$d" 2>/dev/null | grep -E '^[0-9.]+$' >> "$out" ) &
         done
     done
+    wait
+    if [ -s "$out" ]; then
+        sort -u "$out" | while read -r ip; do
+            [ -n "$ip" ] && ipset add "$t4" "$ip" -exist 2>/dev/null
+        done
+        cnt=$(sort -u "$out" | wc -l)
+    fi
+    rm -f "$out"
     if [ "$cnt" -gt 0 ]; then
         ipset create "$IPSET_GEO4" hash:ip family inet maxelem 65536 -exist
         ipset swap "$t4" "$IPSET_GEO4" >/dev/null 2>&1 && ipset destroy "$t4" 2>/dev/null
