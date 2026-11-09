@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.2.2  用法：incus.sh [--apply-only|--scan-only]
+# v6.2.3  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -27,7 +27,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.2"
+SCRIPT_VERSION="6.2.3"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -264,9 +264,18 @@ ensure_dynamic_set() {
     local name=$1 family=$2
     if ipset list -n 2>/dev/null | grep -qx "$name"; then
         if ! ipset list -t "$name" 2>/dev/null | grep -q "timeout 7200"; then
-            ipset destroy "$name" 2>/dev/null && \
-                ipset create "$name" hash:net family "$family" timeout 7200 >/dev/null 2>&1 && \
+            # ipset 被 iptables 引用时无法 destroy（in use by a kernel component），
+            # 先把自有链清空解引用，apply_firewall 之后会整链重建
+            iptables -F "$CH_GUARD" 2>/dev/null; iptables -F "$CH_GUARD_OUT" 2>/dev/null; iptables -F "$CH_GUARD_IN" 2>/dev/null
+            if have_v6; then
+                ip6tables -F "$CH_GUARD" 2>/dev/null; ip6tables -F "$CH_GUARD_OUT" 2>/dev/null; ip6tables -F "$CH_GUARD_IN" 2>/dev/null
+            fi
+            if ipset destroy "$name" 2>/dev/null && \
+               ipset create "$name" hash:net family "$family" timeout 7200 >/dev/null 2>&1; then
                 log "动态白名单池 $name 已重建为带 2h 超时"
+            else
+                log "⚠ 动态白名单池 $name 重建失败（沿用旧集合，条目无超时）"
+            fi
         fi
     else
         ipset create "$name" hash:net family "$family" timeout 7200 >/dev/null 2>&1 || true
