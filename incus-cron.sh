@@ -21,9 +21,11 @@ CONF_DIR="/etc/iptables-custom"
 INIT_SCRIPT="${CONF_DIR}/init.sh"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
 WRAPPER="/usr/local/bin/incus_cron.sh"
-WRAPPER_VERSION="7"
+WRAPPER_VERSION="8"
 LOG_FILE="/var/log/incus_clean.log"
-REMOTE_URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
+# 用 codeload tarball 而不是 raw.githubusercontent.com：
+# raw 会返回 CDN 缓存旧版（曾经把刚装的 6.1.0 覆盖回 6.0.0）
+TARBALL="https://codeload.github.com/huoren-release/incus/tar.gz/refs/heads/main"
 CNIP_URL="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/cn/ipv4-aggregated.txt"
 CNIP6_URL="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/cn/ipv6-aggregated.txt"
 
@@ -260,7 +262,9 @@ SRC_DIR=$(cd "$(dirname "$0")" && pwd)
 if [ -f "${SRC_DIR}/incus.sh" ]; then
     install -m 755 "${SRC_DIR}/incus.sh" /usr/local/lib/incus-guard/incus.sh
     log "执行体已从本地目录安装"
-elif curl -sLf --max-time 120 -o /usr/local/lib/incus-guard/incus.sh "$REMOTE_URL"; then
+elif curl -sLf --max-time 120 -o /tmp/incus.tgz "$TARBALL" \
+     && tar --wildcards -xzOf /tmp/incus.tgz '*/incus.sh' > /usr/local/lib/incus-guard/incus.sh 2>/dev/null \
+     && [ -s /usr/local/lib/incus-guard/incus.sh ]; then
     chmod 755 /usr/local/lib/incus-guard/incus.sh
     log "执行体已从远端安装"
 else
@@ -298,7 +302,9 @@ LOG_FILE="/var/log/incus_clean.log"
 LOCAL_DIR="/usr/local/lib/incus-guard"
 LOCAL="$LOCAL_DIR/incus.sh"
 LOCK="/run/incus_guard.lock"
-URL="https://raw.githubusercontent.com/huoren-release/incus/main/incus.sh"
+# 用 codeload tarball 而不是 raw.githubusercontent.com：
+# raw 会返回 CDN 缓存旧版（曾经把刚装的 6.1.0 覆盖回 6.0.0）
+TARBALL="https://codeload.github.com/huoren-release/incus/tar.gz/refs/heads/main"
 PIN_SHA256="@P@"
 # 远端更新开关：1 = 每轮拉远端并覆盖本地；0 = 只跑本地副本
 ENABLE_REMOTE=1
@@ -318,7 +324,11 @@ START=$(date +%s)
 RC_NOTE=""
 
 if [ "$ENABLE_REMOTE" = "1" ]; then
-    if ! curl -sLf --max-time 60 -H "Cache-Control: no-cache" -o "$LOCAL.tmp" "$URL"; then
+    TMP_TGZ="$LOCAL.tmp.tgz"
+    if ! curl -sLf --max-time 60 -o "$TMP_TGZ" "$TARBALL" \
+        || ! tar --wildcards -xzOf "$TMP_TGZ" '*/incus.sh' > "$LOCAL.tmp" 2>/dev/null \
+        || [ ! -s "$LOCAL.tmp" ]; then
+        rm -f "$TMP_TGZ"
         echo "[$(date '+%F %T')] ⚠ 拉取 incus.sh 失败（网络或仓库不可达），改用本地副本" >> "$LOG_FILE"
         rm -f "$LOCAL.tmp"
         RC_NOTE="拉取失败"
@@ -337,6 +347,7 @@ if [ "$ENABLE_REMOTE" = "1" ]; then
         rm -f "$LOCAL.tmp"
         RC_NOTE="pin 不符"
     else
+        rm -f "$TMP_TGZ"
         mv -f "$LOCAL.tmp" "$LOCAL"; chmod 755 "$LOCAL"
     fi
 fi
