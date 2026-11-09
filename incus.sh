@@ -27,7 +27,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.6"
+SCRIPT_VERSION="6.2.7"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -112,7 +112,6 @@ IPSET_GEO6="geo_v6"
 # ============ 路径 / 链名 ============
 CNIP_LIST="${CONF_DIR}/cnip.list"
 CNIP6_LIST="${CONF_DIR}/cnip6.list"
-LOG_FILE="/var/log/incus_clean.log"
 WRAPPER="/usr/local/bin/incus_cron.sh"
 WRAPPER_VERSION="8"
 CH_GUARD="INCUS_GUARD"
