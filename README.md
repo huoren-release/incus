@@ -1,4 +1,4 @@
-# Incus 宿主安全一体化脚本 v6.1.3
+# Incus 宿主安全一体化脚本 v6.1.4
 
 违规巡检自愈 + 拦截出站 CN 请求 + 防送中（Google/Apple 等定位上报）。
 
@@ -107,8 +107,10 @@ INPUT   → INCUS_GUARD_IN (第 1 位)
 - **crontab 写保护**：读现有 crontab 失败（不只是「no crontab」）时直接中止，
   不再可能写入空表把别人的定时任务清掉；写后读回校验。
 - **应用前快照**：`/etc/iptables-custom/snapshot-<时间戳>.rules`，保留最近 3 份。
-- **解析提速**：定位端点 44 个查询并发跑（`+time=1`），白名单域名不再每轮逐个 dig
-  （改由容器侧 dnsmasq 的 `ipset=` 实时填充），慢 DNS 机器上单轮从 ~50s 降到几秒。
+- **解析提速**：定位端点 44 个查询、白名单域名 38 个查询都并发跑（`+time=1`），
+  慢 DNS 机器上单轮从 ~50s 降到几秒。白名单必须解析进静态表——宿主的探针
+  tcping（如 `sd-ct-v4.ip.zstaticcdn.com:80` 落在 CN 网段）也依赖它，只靠容器侧
+  dnsmasq 的 dynamic 集合覆盖不到宿主自己的连接。
 - **日志只留 200 行**：wrapper 每轮把 `/var/log/incus_clean.log` 裁到最近 200 行，
   不再用 logrotate，翻日志一眼到底。
 - **超时 240s**：小于 cron 的 300s 间隔，不会再出现一轮吃掉下一轮。

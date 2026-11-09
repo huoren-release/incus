@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.1.3  用法：incus.sh [--apply-only|--scan-only]
+# v6.1.4  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -22,7 +22,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.1.3"
+SCRIPT_VERSION="6.1.4"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -210,12 +210,24 @@ sync_ipsets() {
     ipset create whitelist_ips_static hash:net 2>/dev/null || ipset flush whitelist_ips_static
     ipset create whitelist_ips_dynamic hash:net 2>/dev/null || true
 
-    local ip
-    # 白名单域名的解析交给容器侧 dnsmasq 的 ipset= 指令实时填充 dynamic 集合，
-    # 这里只放手工指定的 IP，避免每轮 dig 几十个域名拖慢巡检。
+    local ip out
     for ip in "${WHITELIST_IPS[@]}"; do
         ipset add whitelist_ips_static "$ip" -exist 2>/dev/null || true
     done
+    # 白名单域名并发解析进静态表：宿主的自己的连接（如 NodeGet 探针 tcping
+    # 打 sd-ct-v4.ip.zstaticcdn.com:80 这类落在 CN 网段的目标）也要放行。
+    # 容器侧另有 dnsmasq 的 ipset= 实时补 dynamic，这里不能省。
+    out=$(mktemp)
+    for d in $(uniq_wl_domains); do
+        ( dig +short +time=1 +tries=1 "$d" A 2>/dev/null | grep -E '^[0-9.]+$' >> "$out" ) &
+    done
+    wait
+    if [ -s "$out" ]; then
+        sort -u "$out" | while read -r ip; do
+            [ -n "$ip" ] && ipset add whitelist_ips_static "$ip" -exist 2>/dev/null
+        done
+    fi
+    rm -f "$out"
     return 0
 }
 
