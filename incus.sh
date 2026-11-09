@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.1.4  用法：incus.sh [--apply-only|--scan-only]
+# v6.1.5  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -22,7 +22,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.1.4"
+SCRIPT_VERSION="6.1.5"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -38,7 +38,9 @@ captive.apple.com gstatic.com clients3.google.com clients4.google.com \
 msftconnecttest.com msftncsi.com detectportal.firefox.com connectivity-check.ubuntu.com \
 ping.pe ping.sx ping0.cc \
 ip.sb ipinfo.io ip-api.com ipwho.is ifconfig.me icanhazip.com checkip.amazonaws.com \
-zstaticcdn.com"
+zstaticcdn.com \
+sh-ct-v4.ip.zstaticcdn.com sh-cu-v4.ip.zstaticcdn.com sh-cm-v4.ip.zstaticcdn.com \
+sd-ct-v4.ip.zstaticcdn.com sd-cu-v4.ip.zstaticcdn.com sd-cm-v4.ip.zstaticcdn.com"
 
 DEFAULT_WHITELIST_IPS="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 208.67.222.222"
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =======================================================================
-# Incus 宿主网络安全一体化部署脚本 v6.1.4
+# Incus 宿主网络安全一体化部署脚本 v6.1.5
 #   1) 装依赖（失败才动镜像源，成功绝不动）
 #   2) 写唯一名单 whitelist.conf（incus.sh 直接 source，不再各写一份）
 #   3) 生成定时执行体 wrapper（flock、远端更新、sha256 pin、退出码告警）
@@ -53,6 +53,9 @@ WHITELIST_DOMAINS=(
     "checkip.amazonaws.com"
     # —— Apple 内容 CDN（存量）
     "zstaticcdn.com"
+    # —— NodeGet 探针 tcping/ping 目标（落在 CN 网段，必须放行宿主自己的连接）
+    "sh-ct-v4.ip.zstaticcdn.com" "sh-cu-v4.ip.zstaticcdn.com" "sh-cm-v4.ip.zstaticcdn.com"
+    "sd-ct-v4.ip.zstaticcdn.com" "sd-cu-v4.ip.zstaticcdn.com" "sd-cm-v4.ip.zstaticcdn.com"
 )
 
 WHITELIST_IPS=(
