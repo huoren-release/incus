@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.2.6  用法：incus.sh [--apply-only|--scan-only]
+# v6.2.8  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -22,12 +22,17 @@
 #   8) IPv4/IPv6 双栈：ip6tables 建同名自有链，CN v6 网段与定位 v6 池一并拦截。
 #   9) 白名单静态池「先解析到临时集合、达标才 swap」，DNS 抖动不会清空池子。
 #  10) 动态白名单池带 2h 默认超时，IP 换主后不会永久豁免。
+#  11) UDP 拦截是「有状态」的：只拦 conntrack 状态 NEW 的首包（= 容器主动外连），大陆
+#      客户端打进来的 UDP 会话，容器回包是 ESTABLISHED，照常放行。这套机制依赖 conntrack
+#      撑得住：默认 udp 超时 30s/120s、表上限低到 65536/7680，条目一旦过期或被驱逐，
+#      回包就会被重新算成 NEW、按「主动外连」打掉，表现为 UDP「连得上但时通时断」
+#      → 每轮由 ensure_conntrack_tuning 把时长/上限抬上去（只升不降）。
 # =======================================================================
 
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.7"
+SCRIPT_VERSION="6.2.8"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -144,6 +149,32 @@ ensure_deps() {
 }
 
 have_v6() { command -v ip6tables >/dev/null 2>&1 && ip6tables -L -n >/dev/null 2>&1; }
+
+# conntrack 时长/上限：UDP 没有握手，全靠 conntrack 状态区分「回包」与「主动外连」。
+# 默认 udp_timeout=30s / udp_timeout_stream=120s、nf_conntrack_max 最小可到 7680 条，
+# 一旦过期或表满，容器回包会被重新算成 NEW，被 CN 拦截规则打掉，表现为 UDP 时通时断。
+# 只升不降：不覆盖运维手工调大的值；每轮重刷，重启后由开机任务/cron 重新应用。
+ensure_conntrack_tuning() {
+    local base=/proc/sys/net/netfilter mem_mb want
+    [ -r "$base/nf_conntrack_udp_timeout" ] || return 0
+    tune_ge() {
+        local k=$1 v=$2 cur
+        [ -r "$base/$k" ] || return 0
+        cur=$(cat "$base/$k" 2>/dev/null || echo "")
+        case "${cur:-}" in ''|*[!0-9]*) return 0 ;; esac
+        [ "$cur" -ge "$v" ] && return 0
+        printf '%s' "$v" > "$base/$k" 2>/dev/null && log "conntrack $k: $cur -> $v"
+        return 0
+    }
+    tune_ge nf_conntrack_udp_timeout 180          # 默认 30：只发了包、还没回包的会话
+    tune_ge nf_conntrack_udp_timeout_stream 600   # 默认 120：已有来回收发（QUIC/hysteria2/tuic）
+    mem_mb=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0) / 1024 ))
+    want=262144
+    [ "${mem_mb:-0}" -lt 2048 ] && want=131072
+    [ "${mem_mb:-0}" -lt 1024 ] && want=65536
+    tune_ge nf_conntrack_max "$want"
+    return 0
+}
 
 # incusbr0 raw.dnsmasq：容器侧 dnsmasq 负责填充白名单池与 CN 域名黑洞
 sync_incus_dnsmasq() {
@@ -399,15 +430,20 @@ fill_chain() {
         # ⑤ 容器出站高危端口
         [ -n "$BLOCK_OUT_PORTS" ] && \
             $IPT -A "$ch" -i incusbr0 -p tcp -m multiport --dports "$BLOCK_OUT_PORTS" -j REJECT --reject-with "$RT" 2>/dev/null
-        # ⑥ 拦截去往 CN 的新连接
+        # ⑥ 回程放行：大陆客户端打进来的会话，容器回包是 conntrack ESTABLISHED。
+        #    排在最前既省匹配开销，也把「CN 拦截只看 NEW / SYN 首包」这层语义钉死：
+        #    改这里的人不能把整段 UDP 一起 REJECT，否则入站节点的回包会全灭。
+        $IPT -A "$ch" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        # ⑦ 拦截去往 CN 的新连接：TCP 认 SYN、UDP 认 NEW，都不碰已建立会话的回包
         $IPT -A "$ch" -i incusbr0 -m set --match-set "$set_cnip" dst -p tcp --syn -j REJECT --reject-with "$RT" 2>/dev/null
         $IPT -A "$ch" -i incusbr0 -m set --match-set "$set_cnip" dst -p udp -m conntrack --ctstate NEW -j REJECT --reject-with "$RT" 2>/dev/null
-        # ⑦ 兜底放行（放行必须在拦截之后）
-        $IPT -A "$ch" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        # ⑧ 兜底放行
         $IPT -A "$ch" -i incusbr0 -j ACCEPT 2>/dev/null
         $IPT -A "$ch" -o incusbr0 -j ACCEPT 2>/dev/null
     elif [ "$scope" = "out" ]; then
-        # ⑥ 宿主自身 → CN 的新连接
+        # ⑥ 回程放行（宿主自己发起的会话同理）：ESTABLISHED,RELATED 不受 CN 拦截影响
+        $IPT -A "$ch" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        # ⑦ 宿主自身 → CN 的新连接
         $IPT -A "$ch" -m set --match-set "$set_cnip" dst -p tcp --syn -j REJECT --reject-with "$RT" 2>/dev/null
         $IPT -A "$ch" -m set --match-set "$set_cnip" dst -p udp -m conntrack --ctstate NEW -j REJECT --reject-with "$RT" 2>/dev/null
     fi
@@ -465,7 +501,7 @@ apply_firewall() {
 }
 
 self_check() {
-    local bad="" n
+    local bad="" n udp_cnip est_ln cn_ln
     iptables -C FORWARD -j "$CH_GUARD"     2>/dev/null || bad="$bad FORWARD跳转"
     iptables -C OUTPUT  -j "$CH_GUARD_OUT" 2>/dev/null || bad="$bad OUTPUT跳转"
     iptables -C INPUT   -j "$CH_GUARD_IN"  2>/dev/null || bad="$bad INPUT跳转"
@@ -476,6 +512,22 @@ self_check() {
     # 这些规则插入失败时是静默的，必须显式核对是否真的进了链
     iptables -S "$CH_GUARD" 2>/dev/null | grep -q -- "match-set cnip dst" || bad="$bad CN拦截规则"
     iptables -S "$CH_GUARD" 2>/dev/null | grep -q -- "match-set whitelist_ips_static" || bad="$bad 白名单规则"
+    # UDP 拦截必须带 conntrack 状态，否则大陆入站会话的回包会被一起打掉（= UDP 全禁）
+    udp_cnip=$(iptables -S "$CH_GUARD" 2>/dev/null | grep -- "match-set cnip dst" | grep -- " -p udp ")
+    if [ -z "$udp_cnip" ]; then
+        bad="$bad UDP拦截规则"
+    elif ! printf '%s\n' "$udp_cnip" | grep -q "ctstate"; then
+        bad="$bad UDP拦截无状态(会连回包一起禁)"
+    fi
+    # 回程放行必须排在 CN 拦截之前：语义上 CN 拦截只该看首包，顺序反了就是「先拦后放」，
+    # 后来改规则的人很容易顺手把回包一起禁掉
+    est_ln=$(iptables -S "$CH_GUARD" 2>/dev/null | grep -n "ESTABLISHED" | head -1 | cut -d: -f1)
+    cn_ln=$(iptables -S "$CH_GUARD" 2>/dev/null | grep -n -- "match-set cnip dst" | head -1 | cut -d: -f1)
+    if [ -z "${est_ln:-}" ]; then
+        bad="$bad 回程放行规则"
+    elif [ -n "${cn_ln:-}" ] && [ "${est_ln:-0}" -gt "${cn_ln:-0}" ]; then
+        bad="$bad 回程放行晚于CN拦截"
+    fi
     n=$(iptables -t nat -S OUTPUT 2>/dev/null | grep -c "$HOST_DNS_PORT" || true)
     [ "${n:-0}" -ne 0 ] && bad="$bad 旧53劫持残留"
 
@@ -533,11 +585,12 @@ case "$MODE" in
         [ "$MODE" = "full" ] && sync_incus_dnsmasq
         refresh_geo_ipset inet  "$IPSET_GEO4"
         have_v6 && refresh_geo_ipset inet6 "$IPSET_GEO6"
+        ensure_conntrack_tuning
         apply_firewall
         if ! self_check; then
             exit 1
         fi
-        log "防火墙 + CN 拦截 + 防送中规则已应用（白名单 $(uniq_wl_domains | wc -l) 个域名，v4+v6）"
+        log "防火墙 + CN 拦截 + 防送中规则已应用（白名单 $(uniq_wl_domains | wc -l) 个域名，v4+v6；UDP 仅拦 NEW 首包，回包按 ESTABLISHED 放行）"
         [ "$MODE" = "apply" ] && exit 0
         ;;
     scan)
