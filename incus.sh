@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.2.8  用法：incus.sh [--apply-only|--scan-only]
+# v6.2.9  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -27,12 +27,17 @@
 #      撑得住：默认 udp 超时 30s/120s、表上限低到 65536/7680，条目一旦过期或被驱逐，
 #      回包就会被重新算成 NEW、按「主动外连」打掉，表现为 UDP「连得上但时通时断」
 #      → 每轮由 ensure_conntrack_tuning 把时长/上限抬上去（只升不降）。
+#  12) 重装后必须补系统级初始化（v6.2.9）：rebuild 是裸装镜像，openssh 没装、sshd
+#      没进运行级。面板「重装系统」建好后会初始化，巡检不走那条路，客户被抹之后
+#      就成了谁也登不进去的空壳（u3031 空转 5 天）。现在重装成功即装 openssh、
+#      生成 host key、写 sshd_config、sshd 进 default 运行级并启动，并把重装前
+#      抓到的 root 密码散列经 stdin 写回；不装节点/面板软件，也不碰公钥（面板重装才注入）。
 # =======================================================================
 
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.8"
+SCRIPT_VERSION="6.2.9"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -576,6 +581,69 @@ warn_no_image() {
     echo "   ↳ ⚠ 先执行：incus image copy images:alpine/3.22 local: --alias guard-alpine"
 }
 
+# ============ 重装后系统级初始化（v6.2.9）============
+# 巡检的 rebuild 是「裸装镜像」：openssh 没装、sshd 没进运行级，客户原有的 root
+# 密码也随镜像一起消失 —— 容器变成谁也登不进去的空壳，SSH 和面板 WebSSH 全废
+# （2026-11-19 的 u3031-g3qqd9tw 就是这样，空了 5 天没人发现）。
+# 面板自己的「重装系统」建好后会跑一遍初始化，巡检不走那条路，所以这里补上同一套
+# 系统级初始化：装 openssh → 生成 host key → 写 sshd_config → sshd 进 default 运行级
+# 并启动；并把重装【之前】抓到的 root 密码散列原样写回（只经 stdin，不进 argv、不进日志）。
+# 与面板唯一的有意差异：sshd_config 里 PasswordAuthentication 用 yes，否则客户拿
+# 面板显示的密码根本登不进来（面板那套靠重装时注入公钥，巡检这边拿不到公钥）。
+# 只做系统级初始化，不装面板/节点软件；公钥需客户在面板重装一次才会注入。
+GUARD_SSH_PASSWORD_AUTH="yes"
+
+_cap_access() {  # $1 project $2 container → 重装前的 root 密码散列（取不到就空）
+    local project=$1 c=$2 h
+    h=$(timeout 30 incus exec --project "$project" "$c" -- sh -c 'grep "^root:" /etc/shadow 2>/dev/null | cut -d: -f2 | head -n1' < /dev/null 2>/dev/null)
+    printf '%s\n' "${h:-}"
+}
+
+_post_rebuild_init() {  # $1 project $2 container $3 重装前的 root 密码散列 → echo 一行结果
+    local project=$1 c=$2 ph=$3 out="" i pw="未恢复" note
+    for i in 1 2 3; do
+        out=$(timeout 90 incus exec --project "$project" "$c" \
+            --env PA="$GUARD_SSH_PASSWORD_AUTH" -- sh -c '
+            if [ -f /etc/alpine-release ]; then
+                for t in 1 2 3 4 5; do apk update >/dev/null 2>&1 && break; sleep 2; done
+                apk add --no-cache openssh >/dev/null 2>&1 || apk add --no-cache openssh || exit 3
+                ssh-keygen -A >/dev/null 2>&1
+                printf "%s\n" "Include /etc/ssh/sshd_config.d/*.conf" "PasswordAuthentication ${PA:-yes}" "PermitRootLogin yes" "Subsystem sftp internal-sftp" > /etc/ssh/sshd_config
+                chmod 644 /etc/ssh/sshd_config
+                rc-update add sshd default >/dev/null 2>&1
+                rc-service sshd restart >/dev/null 2>&1 || rc-service sshd start >/dev/null 2>&1
+            else
+                export DEBIAN_FRONTEND=noninteractive
+                for t in 1 2 3 4 5; do apt-get update >/dev/null 2>&1 && break; sleep 3; done
+                apt-get install -y openssh-server >/dev/null 2>&1 || exit 3
+                ssh-keygen -A >/dev/null 2>&1
+                printf "%s\n" "PasswordAuthentication ${PA:-yes}" "PermitRootLogin yes" >> /etc/ssh/sshd_config
+                systemctl enable ssh >/dev/null 2>&1
+                systemctl restart ssh >/dev/null 2>&1
+            fi
+            ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || { echo INIT_NOHOSTKEY; exit 0; }
+            if grep -l "^sshd$" /proc/*/comm 2>/dev/null | head -n1 >/dev/null; then echo INIT_OK; else echo INIT_NOSSHD; fi
+        ' < /dev/null 2>&1 | tail -n1) || out=""
+        case "$out" in INIT_OK) break;; esac
+        sleep 3
+    done
+    case "$out" in
+        INIT_OK)        note="✅ openssh 已装、sshd 已启用";;
+        INIT_NOHOSTKEY) note="⚠ sshd 起来了但 host key 缺失";;
+        INIT_NOSSHD)    note="⚠ openssh 装了但 sshd 没在跑";;
+        *)              note="❌ 初始化失败（apk/apt 或容器网络问题，需人工介入）";;
+    esac
+    # 回写重装前的 root 密码散列：只走 stdin，不进 argv、不进日志
+    if [ -n "$ph" ] && [ "$ph" != "*" ] && [ "$ph" != "!" ]; then
+        if printf 'root:%s\n' "$ph" | timeout 60 incus exec --project "$project" "$c" -- chpasswd -e >/dev/null 2>&1; then
+            pw="已恢复"
+        else
+            pw="回写失败"
+        fi
+    fi
+    echo "$note（root 密码:$pw，节点软件未装；公钥需客户在面板重装一次才注入）"
+}
+
 # =======================================================================
 case "$MODE" in
     apply|full)
@@ -707,6 +775,7 @@ ${BIN##*/}"
                 continue
             fi
             echo "   ↳ 🔄 强制执行抹除性重装自愈（镜像 $TARGET_IMAGE）..."
+            PRE_HASH=$(_cap_access "$project" "$c")
             RB_OUT=$(timeout 300 incus rebuild --project "$project" "$TARGET_IMAGE" "$c" --force < /dev/null 2>&1)
             RB_RC=$?
             if [ "$RB_RC" -eq 0 ]; then
@@ -718,6 +787,7 @@ ${BIN##*/}"
                 fi
                 if [ "$ST" = "RUNNING" ]; then
                     echo "   ↳ ✅ 重装成功，容器已恢复运行"
+                    echo "   ↳ 🧰 系统初始化：$(_post_rebuild_init "$project" "$c" "$PRE_HASH")"
                 else
                     echo "   ↳ ❌ FATAL 重装返回成功但容器状态为 ${ST:-未知}，需人工介入"
                 fi

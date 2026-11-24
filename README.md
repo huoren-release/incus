@@ -1,4 +1,4 @@
-# Incus 宿主安全一体化脚本 v6.2.0
+# Incus 宿主安全一体化脚本 v6.2.9
 
 违规巡检自愈 + 拦截出站 CN 请求 + 防送中（Google/Apple 等定位上报）。
 
@@ -91,6 +91,17 @@ INPUT   → INCUS_GUARD_IN (第 1 位)
 
 升级时会自动清理旧版留下的 nat 规则与 `/etc/dnsmasq.d/dynamic_whitelist.conf`，
 并在确认该配置没有别的用途后 `systemctl disable --now dnsmasq`。
+
+## 关键修复点（v6.2.9）
+
+- **重装补系统级初始化**：`incus rebuild` 装的是裸镜像，openssh 没装、sshd 不在运行级。
+  面板的「重装系统」建好后会跑初始化，巡检不走那条路，客户被抹之后就变成谁也登不进去的
+  空壳（Andnode 的 u3031-g3qqd9tw 从 11-19 空到 11-24，WebSSH/SSH 全废也没人知道）。
+  现在 rebuild 成功即：装 openssh → 生成 host key → 写 sshd_config → sshd 进 default
+  运行级并启动；并把**重装前**抓到的 root 密码散列经 stdin 写回（不进 argv、不进日志）。
+  - 与面板唯一有意差异：`PasswordAuthentication` 用 `yes`（面板是 `no`，它靠重装时注入公钥）。
+    巡检拿不到客户公钥，不放开密码认证客户照样进不来；公钥仍要客户在面板重装一次才注入。
+  - 只做系统级初始化，不装面板/节点软件；两次重试上限 90s，撑不住 wrapper 的 900s 超时。
 
 ## 关键修复点（v6.2.0）
 
