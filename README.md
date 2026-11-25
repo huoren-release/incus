@@ -1,4 +1,4 @@
-# Incus 宿主安全一体化脚本 v6.2.9
+# Incus 宿主安全一体化脚本 v6.3.0
 
 违规巡检自愈 + 拦截出站 CN 请求 + 防送中（Google/Apple 等定位上报）。
 
@@ -91,6 +91,19 @@ INPUT   → INCUS_GUARD_IN (第 1 位)
 
 升级时会自动清理旧版留下的 nat 规则与 `/etc/dnsmasq.d/dynamic_whitelist.conf`，
 并在确认该配置没有别的用途后 `systemctl disable --now dnsmasq`。
+
+## 关键修复点（v6.3.0）
+
+- **重装镜像优先 `guard-alpine`**：巡检 `incus rebuild` 时先找本地别名 `guard-alpine`
+  （Alpine 3.22，openssh `10.0_p1-r11`，已修 CVE-2026-123158 的密码认证绕过），
+  找不到才退回容器原镜像。此前是「容器原镜像优先」，容器创建时是 3.21 的话，rebuild
+  就把 3.21 的老 openssh 原样装回来，漏洞根本修不掉。
+  - 各宿主部署前先执行一次：`incus image copy images:alpine/3.22 local: --alias guard-alpine`
+    （本地已有 3.22 镜像的，用 `incus image alias create guard-alpine <fingerprint>` 即可）。
+  - Alpine 3.21 分支至今没有 openssh 修复版（`apk fix openssh` 后二进制 md5 不变，
+    仍是 `9.9_p2-r1`），所以只能靠升基线版本。
+- 已部署验证：HK / Andnode / US / ACCK / Akile 五台宿主均为 6.3.0，
+  `--scan-only` 全量盘查（49+48+20+18+8 台）命中 0、未扫描 0。
 
 ## 关键修复点（v6.2.9）
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.2.9  用法：incus.sh [--apply-only|--scan-only]
+# v6.3.0  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -16,9 +16,9 @@
 #   5) 不再劫持宿主 53 端口：容器 DNS 走 incusbr0 自带 dnsmasq，宿主去 CN
 #      的流量在 OUTPUT 按网段拦截，去掉「dnsmasq 挂了宿主 DNS 全废」的故障点。
 #   6) 名单单一来源：/etc/iptables-custom/whitelist.conf（部署脚本生成）。
-#   7) 重装镜像按容器自己的基础镜像挑，挑不到就拒绝处置（v6.2.0）。
-#      v6.1.x 无本地镜像时回退到 images:alpine/latest，该别名并不存在，
-#      导致 rebuild 先停容器再取镜像失败，把用户容器留在 STOPPED。
+#   7) 重装镜像按 guard-alpine 优先（v6.3.0）：优先用本地 guard-alpine 别名（Alpine 3.22，
+#      openssh 10.0_p1-r11 已修 CVE-2026-123158），没有才退回容器原镜像。此前优先原镜像，
+#      等于把 3.21 的老 openssh 原样重装回来，漏洞修不掉。挑不到镜像就拒绝处置。
 #   8) IPv4/IPv6 双栈：ip6tables 建同名自有链，CN v6 网段与定位 v6 池一并拦截。
 #   9) 白名单静态池「先解析到临时集合、达标才 swap」，DNS 抖动不会清空池子。
 #  10) 动态白名单池带 2h 默认超时，IP 换主后不会永久豁免。
@@ -37,7 +37,7 @@
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.2.9"
+SCRIPT_VERSION="6.3.0"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
@@ -565,6 +565,13 @@ ensure_wrapper() {
 # 绝不再回退到 images:<distro>/latest：那个别名不存在，rebuild 会先停容器再取镜像失败。
 pick_image() {
     local project=$1 c=$2 os fp cand
+    # v6.3.0：优先 guard-alpine（Alpine 3.22，openssh 10.0_p1-r11 已修 CVE-2026-123158）。
+    # 原来优先「容器自己的基础镜像」，等于把容器创建时的 3.21 老 openssh 原样 rebuild
+    # 回来，漏洞根本修不掉。各宿主需先执行：
+    #   incus image copy images:alpine/3.22 local: --alias guard-alpine
+    if incus image alias list local: -f csv 2>/dev/null | cut -d, -f1 | grep -qx "guard-alpine"; then
+        echo "local:guard-alpine"; return 0
+    fi
     fp=$(incus config get "$c" volatile.base_image --project "$project" 2>/dev/null || true)
     if [ -n "$fp" ] && incus image list local: -f csv -c f 2>/dev/null | grep -qx "$fp"; then
         echo "local:$fp"; return 0
