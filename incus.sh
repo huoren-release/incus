@@ -1,7 +1,7 @@
 #!/bin/bash
 # =======================================================================
 # Incus 宿主：违规巡检自愈 + CN 出站拦截 + 防送中（Google/Apple 定位上报）
-# v6.3.0  用法：incus.sh [--apply-only|--scan-only]
+# v6.3.1  用法：incus.sh [--apply-only|--scan-only]
 #   --apply-only  只重建防火墙与防送中规则，不做容器扫描
 #   --scan-only   只做容器扫描（不重建防火墙、不重装），用于验证
 # 设计要点：
@@ -32,15 +32,20 @@
 #      就成了谁也登不进去的空壳（u3031 空转 5 天）。现在重装成功即装 openssh、
 #      生成 host key、写 sshd_config、sshd 进 default 运行级并启动，并把重装前
 #      抓到的 root 密码散列经 stdin 写回；不装节点/面板软件，也不碰公钥（面板重装才注入）。
+#  13) 白名单容器（v6.3.1）：/etc/iptables-custom/skip_containers.conf 里列出的容器名
+#      或通配模式（如 u905-*）跳过违规检测——不扫描、不重装；只影响扫描，宿主级
+#      CN 出站拦截与防送中照旧生效。
 # =======================================================================
 
 set -uo pipefail
 
 # 执行体版本：wrapper 用它做「只升不降」判断，防止 CDN 缓存把本地副本换成旧版
-SCRIPT_VERSION="6.3.0"
+SCRIPT_VERSION="6.3.1"
 
 CONF_DIR="/etc/iptables-custom"
 GUARD_CONF="${CONF_DIR}/whitelist.conf"
+# 白名单容器（跳过扫描/重装），每行一个模式，支持通配，如 u905-* 或 u905-gg9p1klq
+SKIP_CONF="${CONF_DIR}/skip_containers.conf"
 
 # ============ 默认名单（可被 whitelist.conf 覆盖）============
 # 域名按后缀匹配：写 speedtest.net 即覆盖 *.speedtest.net，不需要再写 *. 前缀
@@ -72,11 +77,16 @@ WHITELIST_IPS=()
 WHITELIST_IPS6=()
 BLACKLIST_DOMAINS=()
 BLOCK_OUT_PORTS=""
+SKIP_CONTAINERS=()
 
 load_conf() {
     if [ -r "$GUARD_CONF" ]; then
         # shellcheck disable=SC1090
         . "$GUARD_CONF" || true
+    fi
+    if [ -r "$SKIP_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$SKIP_CONF" || true
     fi
     [ "${#WHITELIST_DOMAINS[@]}" -eq 0 ] && read -r -a WHITELIST_DOMAINS <<< "$DEFAULT_WHITELIST_DOMAINS"
     [ "${#WHITELIST_IPS[@]}" -eq 0 ]     && read -r -a WHITELIST_IPS     <<< "$DEFAULT_WHITELIST_IPS"
@@ -687,12 +697,24 @@ COUNT=0
 HIT=0
 SKIP=0
 UNSCANNED=0
+SKIPPED=0
 
 for project in $PROJECT_LIST; do
     [ -z "$project" ] && continue
     RUNNING=$(incus list --project "$project" -f csv -c ns 2>/dev/null | awk -F, 'tolower($0) ~ /,running$/ {print $1}')
     for c in $RUNNING; do
         [ -z "$c" ] && continue
+        # 白名单容器：命中 skip_containers.conf 的模式就整台跳过（不扫描、不重装）
+        _skip=0
+        for pat in ${SKIP_CONTAINERS[@]+"${SKIP_CONTAINERS[@]}"}; do
+            [ -z "$pat" ] && continue
+            case "$c" in $pat) _skip=1; break ;; esac
+        done
+        if [ "$_skip" = "1" ]; then
+            SKIPPED=$((SKIPPED+1))
+            printf "[--] 跳过白名单容器: %-26s [项目: %s]\n" "$c" "$project"
+            continue
+        fi
         COUNT=$((COUNT+1))
         printf "[%d] 正在盘查: %-26s [项目: %-8s] -> " "$COUNT" "$c" "$project"
 
@@ -808,4 +830,4 @@ ${BIN##*/}"
 done
 
 echo "------------------------------------------------"
-log "巡检结束：盘查 ${COUNT} 台，命中 ${HIT} 台，未扫描 ${UNSCANNED} 台，拒绝处置 ${SKIP} 台"
+log "巡检结束：盘查 ${COUNT} 台，命中 ${HIT} 台，未扫描 ${UNSCANNED} 台，拒绝处置 ${SKIP} 台，白名单跳过 ${SKIPPED} 台"
